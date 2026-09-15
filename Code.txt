@@ -1,0 +1,12 @@
+// Code.gs  ―  Google Apps Script バックエンド
+function doGet() {
+  return HtmlService.createTemplateFromFile('session_index')
+    .evaluate()
+    .setTitle('ウクレレ伴奏')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}

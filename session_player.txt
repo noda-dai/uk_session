@@ -1,0 +1,562 @@
+<script>
+// ===================================================================
+// session_player.txt  — SessionSpace 再生コントローラ  v2
+//
+// v1 → v2 の変更:
+//   [Fix-Timeline] _sessionBuildTimeline を廃止し、
+//                  solo_js_player の _buildAbsoluteTimeline を共用する。
+//                  旧実装は beatsPerBar=4 固定・タイ処理なしで、
+//                  MIDIインポート曲や変拍子で再生速度がずれる原因だった。
+//   [Add-Tempo]    sessionPlayerSetTempo() を追加。
+//                  SoloPlayer と同じアルゴリズムで再生中テンポ変更に対応。
+//   [Add-Seek]     sessionPlayerSeekToMeasure() を追加（小節単位シーク）。
+//                  measureStartTimes テーブルを参照して正確にジャンプする。
+//   [Fix-Seek-Old] 旧 sessionPlayerSeek() は秒数固定計算のため廃止し、
+//                  measureStartTimes テーブル参照方式に統一。
+//
+// 依存（共有ライブラリ）:
+//   solo_js_player.txt  — AudioContext, _pluckUkulele, _fretToFreq,
+//                         _midiToFreq, _buildUkuleleWaves,
+//                         _buildAbsoluteTimeline   ← [Fix-Timeline] 追加依存
+//   session_data.txt    — INSTRUMENT_PROFILES, SESSION_ROLES,
+//                         SESSION_MODES, PIANO_WAVE_PARAMS
+//   session_engine.txt  — reapplyBatonRoles, buildFreqBands
+// ===================================================================
+
+// ---------------------------------------------------------------
+// SessionPlayer 状態オブジェクト
+// ---------------------------------------------------------------
+
+const SessionPlayer = {
+  // AudioContext（solo_js_player の _soloPlayerInitAudio で初期化されたものを共用）
+  ctx:             null,
+  masterGain:      null,
+
+  // 再生状態
+  isPlaying:       false,
+  isPaused:        false,
+  schedulerTimer:  null,
+  startAudioTime:  0,
+  pauseAudioOffset:0,
+  LOOKAHEAD:       0.25,
+  INTERVAL_MS:     80,
+
+  // スコア
+  score:           null,    // SessionScore（現在再生中・バトンタッチで差し替わる）
+  _originalScore:  null,    // 初回セット時のオリジナルスコア（reapplyBatonRoles の元として常に使う）
+  allEvents:       [],      // タイムライン展開済みイベント列
+  measureStartTimes: [],    // 小節開始時刻テーブル
+  nextEventIdx:    0,
+  totalDuration:   0,
+  tempo:           100,
+  loop:            false,
+  currentMeasure:  -1,
+
+  // 声部ミュート（ユーザーが担当する voice をパートナー再生から除外）
+  mute: { melody: false, bass: false, inner: false },
+
+  // バトンタッチ
+  batonSchedule:   null,    // buildBatonSchedule() の出力
+  batonUserRole:   null,    // 現在のユーザー役割
+  _batonBusy:      false,   // 切り替え中ガード
+
+  // コールバック
+  onMeasureChange: null,    // (mi, userRole) => void
+  onBatonSwitch:   null,    // (newUserRole, nextUserRole) => void
+  onComplete:      null,    // () => void
+};
+
+// ---------------------------------------------------------------
+// AudioContext 共用初期化
+// ---------------------------------------------------------------
+
+/**
+ * AudioContext 初期化。
+ *
+ * _pluckUkulele / _ukWave / _ukBody は SoloPlayer の ctx に紐づいて
+ * 生成されたノードを使用する。SessionPlayer が別の AudioContext を
+ * 作ると connect() 時に InvalidAccessError になるため、
+ * 必ず _soloPlayerInitAudio() を経由して SoloPlayer.ctx を共用する。
+ */
+function _sessionPlayerInitAudio() {
+  // SoloPlayer の初期化を先に実行して ctx / masterGain / _ukWave / _ukBody を確保
+  if (typeof _soloPlayerInitAudio === 'function') {
+    _soloPlayerInitAudio();
+  }
+  // SoloPlayer の ctx をそのまま共用（ノードが同一 ctx に属する）
+  if (typeof SoloPlayer !== 'undefined' && SoloPlayer.ctx) {
+    SessionPlayer.ctx        = SoloPlayer.ctx;
+    SessionPlayer.masterGain = SoloPlayer.masterGain;
+    return;
+  }
+  console.error('SessionPlayer: SoloPlayer.ctx が初期化されていません');
+}
+
+// ---------------------------------------------------------------
+// タイムライン構築  [Fix-Timeline]
+// ---------------------------------------------------------------
+
+/**
+ * SessionScore から再生用タイムライン（allEvents）を構築する。
+ *
+ * ▼ v1 からの変更点
+ *   旧実装は beatsPerBar=4 固定の単純計算だったため、
+ *   MIDIインポート曲（beatsPerBar が小節ごとに異なる）や
+ *   タイ音符（beat が小数になる）で再生速度がずれていた。
+ *
+ *   v2 では solo_js_player の _buildAbsoluteTimeline() を委譲して
+ *   完全に統一。SoloPlayer / SessionPlayer で同一ロジックを使う。
+ *
+ * @param {object} score  SessionScore
+ * @param {number} tempo  BPM
+ */
+function _sessionBuildTimeline(score, tempo) {
+  // solo_js_player の _buildAbsoluteTimeline に委譲（共通実装）
+  if (typeof _buildAbsoluteTimeline === 'function') {
+    // [C2] _buildAbsoluteTimeline は ev.voice===undefined をスキップする。
+    //      MIDIインポートスコアは _assignRolesFromPitch で voice が付与されるが、
+    //      念のため voice が未定義のイベントに 'inner' を補完してからタイムライン構築する。
+    if (score?.measures) {
+      score.measures.forEach(m => {
+        (m.events ?? []).forEach(ev => {
+          if (ev.voice === undefined || ev.voice === null) ev.voice = 'inner';
+          if (ev.midi  === undefined || ev.midi  === null) ev.midi  = 60;
+        });
+      });
+    }
+    const result = _buildAbsoluteTimeline(score, tempo);
+    SessionPlayer.allEvents         = result.events;
+    SessionPlayer.measureStartTimes = result.measureStartTimes;
+    SessionPlayer.totalDuration     = result.totalDuration;
+    return;
+  }
+
+  // フォールバック: solo_js_player が未ロードの場合（開発時デバッグ用）
+  console.warn('SessionPlayer: _buildAbsoluteTimeline が見つかりません。フォールバック実装を使用します');
+  const secPerBeat = 60 / tempo;
+  const events     = [];
+  let   totalSec   = 0;
+  const measureStartTimes = [];
+  let   measureStart      = 0;
+
+  (score.measures ?? []).forEach((m, mi) => {
+    const bpb = m.beatsPerBar ?? 4;   // ← 小節ごとの拍数を参照
+    measureStartTimes.push(measureStart);
+
+    (m.events ?? []).forEach(ev => {
+      const absTime = measureStart + (ev.beat - 1) * secPerBeat;
+      const durSec  = (ev.duration ?? 0.5) * secPerBeat;
+      events.push({ ...ev, absTime, durSec, _measureIdx: mi });
+    });
+
+    totalSec      = Math.max(totalSec, measureStart + bpb * secPerBeat);
+    measureStart += bpb * secPerBeat;
+  });
+
+  events.sort((a, b) => a.absTime - b.absTime);
+  SessionPlayer.allEvents         = events;
+  SessionPlayer.measureStartTimes = measureStartTimes;
+  SessionPlayer.totalDuration     = totalSec;
+}
+
+// ---------------------------------------------------------------
+// 再生制御
+// ---------------------------------------------------------------
+
+/**
+ * セッション再生を開始する
+ *
+ * @param {object} score    SessionScore（buildPartnerScore の出力）
+ * @param {object} opts
+ * @param {number}    opts.tempo
+ * @param {boolean}   opts.loop
+ * @param {object}    opts.batonSchedule  buildBatonSchedule() の出力（任意）
+ * @param {string}    opts.userRole
+ * @param {function}  opts.onMeasureChange
+ * @param {function}  opts.onBatonSwitch
+ * @param {function}  opts.onComplete
+ */
+function sessionPlayerPlay(score, opts = {}) {
+  _sessionPlayerInitAudio();
+  const ctx = SessionPlayer.ctx;
+  if (!ctx) {
+    alert('お使いのブラウザはWeb Audio APIに対応していません');
+    return;
+  }
+  if (ctx.state === 'suspended') ctx.resume();
+
+  // E2修正: 一時停止からの再開
+  // 旧実装は isPaused && score===score で判定していたが、
+  // バトンタッチ後は SessionPlayer.score が差し替えられているため
+  // ssCurrentScore !== SessionPlayer.score となり新規再生扱いになっていた。
+  // isPaused フラグのみで判定することで正しく再開できる。
+  if (SessionPlayer.isPaused) {
+    SessionPlayer.isPaused        = false;
+    SessionPlayer.isPlaying       = true;
+    SessionPlayer.startAudioTime  = ctx.currentTime;
+    // コールバックを新しいものに更新（ssTogglePlay から渡される）
+    if (opts.onMeasureChange) SessionPlayer.onMeasureChange = opts.onMeasureChange;
+    if (opts.onBatonSwitch)   SessionPlayer.onBatonSwitch   = opts.onBatonSwitch;
+    if (opts.onComplete)      SessionPlayer.onComplete      = opts.onComplete;
+    SessionPlayer.schedulerTimer  = setInterval(_sessionSchedule, SessionPlayer.INTERVAL_MS);
+    _sessionUpdateUI('playing');
+    return;
+  }
+
+  // 新規再生
+  sessionPlayerStop();
+
+  SessionPlayer.score            = score;
+  SessionPlayer._originalScore   = score;  // ループ・バトンタッチ用に元スコアを保存
+  SessionPlayer.tempo            = opts.tempo ?? score.tempo ?? 100;
+  SessionPlayer.loop             = opts.loop  ?? false;
+  SessionPlayer.batonSchedule    = opts.batonSchedule ?? null;
+  SessionPlayer.batonUserRole    = opts.userRole ?? 'MELODY_HIGH';
+  SessionPlayer.onMeasureChange  = opts.onMeasureChange ?? null;
+  SessionPlayer.onBatonSwitch    = opts.onBatonSwitch   ?? null;
+  SessionPlayer.onComplete       = opts.onComplete      ?? null;
+
+  _sessionBuildTimeline(score, SessionPlayer.tempo);
+
+  // voice mute を現在の userRole に合わせて設定
+  _sessionApplyMuteFromRole(SessionPlayer.batonUserRole);
+
+  SessionPlayer.nextEventIdx     = 0;
+  SessionPlayer.currentMeasure   = -1;
+  SessionPlayer.isPlaying        = true;
+  SessionPlayer.isPaused         = false;
+  SessionPlayer.startAudioTime   = ctx.currentTime;
+  SessionPlayer.pauseAudioOffset = 0;
+  SessionPlayer.schedulerTimer   = setInterval(_sessionSchedule, SessionPlayer.INTERVAL_MS);
+
+  _sessionUpdateUI('playing');
+}
+
+/**
+ * 再生停止
+ */
+function sessionPlayerStop() {
+  clearInterval(SessionPlayer.schedulerTimer);
+  SessionPlayer.isPlaying        = false;
+  SessionPlayer.isPaused         = false;
+  SessionPlayer.schedulerTimer   = null;
+  SessionPlayer.nextEventIdx     = 0;
+  SessionPlayer.currentMeasure   = -1;
+  SessionPlayer.pauseAudioOffset = 0;
+  _sessionUpdateUI('stopped');
+}
+
+/**
+ * 一時停止
+ */
+function sessionPlayerPause() {
+  if (!SessionPlayer.isPlaying) return;
+  clearInterval(SessionPlayer.schedulerTimer);
+  const ctx = SessionPlayer.ctx;
+  SessionPlayer.pauseAudioOffset += ctx.currentTime - SessionPlayer.startAudioTime;
+  SessionPlayer.isPlaying  = false;
+  SessionPlayer.isPaused   = true;
+  SessionPlayer.schedulerTimer = null;
+  _sessionUpdateUI('paused');
+}
+
+/**
+ * 指定小節にシーク  [Fix-Seek / Add-Seek]
+ *
+ * ▼ v2 → v3 変更点
+ *   [B4] 停止中・一時停止中からのシークで isPaused を立て、
+ *        次の ssTogglePlay が「再開」パスに入れるよう修正。
+ *        再生中シーク時の startAudioTime リセットを
+ *        pauseAudioOffset 確定後に行うよう順序も修正。
+ *
+ * @param {number} mi  小節インデックス（0始まり）
+ */
+function sessionPlayerSeek(mi) {
+  const score = SessionPlayer.score;
+  if (!score) return;
+
+  const totalMeasures = score.measures.length;
+  const targetMi      = Math.max(0, Math.min(mi, totalMeasures - 1));
+  const targetTime    = SessionPlayer.measureStartTimes[targetMi] ?? 0;
+
+  // nextEventIdx を新位置に合わせる
+  const idx = SessionPlayer.allEvents
+    .findIndex(ev => ev.absTime >= targetTime);
+  SessionPlayer.nextEventIdx   = idx < 0 ? SessionPlayer.allEvents.length : idx;
+  SessionPlayer.currentMeasure = targetMi - 1;  // 次スケジューラループで変更検出
+
+  if (SessionPlayer.isPlaying && SessionPlayer.ctx) {
+    // 再生中: offset を確定してから基準時刻をリセット（順序が重要）
+    SessionPlayer.pauseAudioOffset = targetTime;
+    SessionPlayer.startAudioTime   = SessionPlayer.ctx.currentTime;
+  } else {
+    // 停止中 / 一時停止中: offset を記憶し isPaused を立てる
+    // → 次の ssTogglePlay が sessionPlayerPlay の「再開」パスに入り
+    //   この pauseAudioOffset から演奏が再開される
+    SessionPlayer.pauseAudioOffset = targetTime;
+    SessionPlayer.isPaused         = true;
+    _sessionUpdateUI('paused');   // ▶ ボタンを表示
+  }
+}
+
+/**
+ * 小節単位のシーク（UIのジャンプボタン用）  [Add-Seek]
+ * [C3] currentMeasure が -1（未再生）の場合はdeltaの正負に応じて先頭/末尾に補正
+ * @param {number} delta  +1 で次の小節、-1 で前の小節
+ */
+function sessionPlayerSeekToMeasure(delta) {
+  const cur   = SessionPlayer.currentMeasure;
+  const total = SessionPlayer.score?.measures?.length ?? 0;
+  // 未再生（-1）のとき: 前方向なら先頭(0)、後方向は末尾(total-1)
+  const base  = cur < 0 ? (delta < 0 ? 0 : -1) : cur;
+  const next  = Math.max(0, Math.min(base + delta, total - 1));
+  sessionPlayerSeek(next);
+}
+
+/**
+ * テンポを変更して再生タイムラインを再構築する  [Add-Tempo]
+ *
+ * 再生中でも呼び出し可能。SoloPlayer.soloPlayerSetTempo と同じアルゴリズムで
+ * 「旧テンポ基準の経過拍数 → 新テンポ秒数」に変換することで
+ * 現在の再生位置を保持したままテンポを切り替える。
+ *
+ * ▼ v2 → v3 変更点 [B5]
+ *   旧実装は sessionPlayerSeek(currentMi) を呼んで小節先頭に戻していたため、
+ *   テンポ変更のたびに再生位置が小節頭にリセットされていた。
+ *   v3 では SoloPlayer と同じ「拍位置保持」方式に統一。
+ *   また sessionPlayerSeek が isPaused を立てる [B4] 修正の影響を受けないよう、
+ *   テンポ変更後のスケジューラ再起動を直接行う。
+ *
+ * @param {number} newTempo  新しい BPM（40〜240）
+ */
+function sessionPlayerSetTempo(newTempo) {
+  const bpm   = Math.max(40, Math.min(240, newTempo));
+  const score = SessionPlayer.score;
+  if (!score) {
+    SessionPlayer.tempo = bpm;
+    if (typeof sessionUIUpdateTempo === 'function') sessionUIUpdateTempo(bpm);
+    return;
+  }
+
+  const wasPlaying = SessionPlayer.isPlaying;
+
+  // スケジューラを止めてタイムラインを再構築
+  clearInterval(SessionPlayer.schedulerTimer);
+  SessionPlayer.schedulerTimer = null;
+
+  // [B5] 旧テンポ基準の経過秒 → 拍位置 → 新テンポ秒 に変換
+  //       SoloPlayer.soloPlayerSetTempo と同じアルゴリズム
+  const oldTempo      = SessionPlayer.tempo;
+  const ctx           = SessionPlayer.ctx;
+  const elapsed       = wasPlaying && ctx
+    ? ctx.currentTime - SessionPlayer.startAudioTime + SessionPlayer.pauseAudioOffset
+    : SessionPlayer.pauseAudioOffset;
+  const oldSecPerBeat = 60 / oldTempo;
+  const newSecPerBeat = 60 / bpm;
+  const beatPosition  = elapsed / oldSecPerBeat;
+  const newOffset     = beatPosition * newSecPerBeat;
+
+  // テンポ確定・タイムライン再構築
+  SessionPlayer.tempo = bpm;
+  _sessionBuildTimeline(score, bpm);
+
+  // 新タイムライン上の対応位置に nextEventIdx を合わせる
+  const newOffsetClamped = Math.max(0, newOffset);
+  SessionPlayer.pauseAudioOffset = newOffsetClamped;
+  const idx = SessionPlayer.allEvents.findIndex(ev => ev.absTime >= newOffsetClamped);
+  SessionPlayer.nextEventIdx = idx >= 0 ? idx : SessionPlayer.allEvents.length;
+
+  // スケジューラ再起動（全イベント確定後に startAudioTime を更新）
+  if (wasPlaying && ctx) {
+    SessionPlayer.startAudioTime = ctx.currentTime;
+    SessionPlayer.schedulerTimer = setInterval(_sessionSchedule, SessionPlayer.INTERVAL_MS);
+  }
+
+  if (typeof sessionUIUpdateTempo === 'function') sessionUIUpdateTempo(bpm);
+}
+
+// ---------------------------------------------------------------
+// 音符スケジューラ
+// ---------------------------------------------------------------
+
+/**
+ * LOOKAHEAD 先読みで音符をスケジューリングするメインループ
+ * solo_js_player の _soloPlayerSchedule と同等の設計
+ * @private
+ */
+function _sessionSchedule() {
+  const { ctx, masterGain, allEvents, mute, tempo } = SessionPlayer;
+  if (!ctx || !SessionPlayer.isPlaying) return;
+
+  const elapsed     = ctx.currentTime - SessionPlayer.startAudioTime
+                    + SessionPlayer.pauseAudioOffset;
+  const scheduleEnd = elapsed + SessionPlayer.LOOKAHEAD;
+
+  // VOICE_GAIN: パートナー音量（ユーザーより少し抑える）
+  const VOICE_GAIN  = { melody: 1.0, bass: 0.5, inner: 0.28 };
+
+  while (SessionPlayer.nextEventIdx < allEvents.length) {
+    const ev        = allEvents[SessionPlayer.nextEventIdx];
+    if (ev.absTime > scheduleEnd) break;
+
+    const audioTime = SessionPlayer.startAudioTime + ev.absTime - SessionPlayer.pauseAudioOffset;
+
+    if (audioTime >= ctx.currentTime - 0.01 && !mute[ev.voice]) {
+      const base    = VOICE_GAIN[ev.voice] ?? 0.4;
+      const gainVal = Math.min(base * (ev.emphasis ?? 1.0), 1.0);
+
+      let freq;
+      if (ev.stringIdx !== undefined && ev.stringIdx >= 0 && ev.stringIdx <= 3
+          && ev.fret    !== undefined && ev.fret    >= 0) {
+        freq = _fretToFreq(ev.stringIdx, ev.fret);
+      } else {
+        freq = _midiToFreq(ev.midi);
+      }
+
+      // solo_js_player の _pluckUkulele を流用
+      _pluckUkulele(ctx, masterGain, freq, gainVal, audioTime, ev.durSec, ev.voice, ev.stringIdx ?? 3);
+    }
+    SessionPlayer.nextEventIdx++;
+  }
+
+  // 小節ハイライト更新
+  const startTimes = SessionPlayer.measureStartTimes;
+  let   currentMi  = 0;
+  if (startTimes?.length > 0) {
+    let lo = 0, hi = startTimes.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (startTimes[mid] <= elapsed) lo = mid; else hi = mid - 1;
+    }
+    currentMi = lo;
+  }
+  const clampedMi = Math.min(currentMi,
+    (SessionPlayer.score?.measures?.length ?? 1) - 1);
+
+  if (clampedMi !== SessionPlayer.currentMeasure && clampedMi >= 0) {
+    SessionPlayer.currentMeasure = clampedMi;
+    _sessionOnMeasureChange(clampedMi);
+  }
+
+  // 終了チェック
+  if (elapsed >= SessionPlayer.totalDuration + 0.3) {
+    if (SessionPlayer.loop) {
+      // ループ再生
+      SessionPlayer.nextEventIdx     = 0;
+      SessionPlayer.pauseAudioOffset = 0;
+      SessionPlayer.startAudioTime   = ctx.currentTime;
+      SessionPlayer.currentMeasure   = -1;
+
+      // ループ先頭で schedule[0] の役割を即時適用し、
+      // _originalScore からスコアを再計算してタブ譜・帯域を正しく更新する
+      const schedule = SessionPlayer.batonSchedule;
+      if (schedule?.[0]) {
+        const loopStartRole = schedule[0].userRole;
+        SessionPlayer.batonUserRole = loopStartRole;
+        _sessionApplyMuteFromRole(loopStartRole);
+
+        const baseScore = SessionPlayer._originalScore;
+        if (baseScore?._isSessionScore) {
+          const newScore = reapplyBatonRoles(
+            baseScore, loopStartRole,
+            baseScore.key ?? 'C', baseScore._complexity ?? 0.5
+          );
+          SessionPlayer.score = newScore;
+        }
+        // UIにループ先頭の役割とタブ譜を即時反映
+        SessionPlayer.onMeasureChange?.(0, loopStartRole);
+      }
+    } else {
+      sessionPlayerStop();
+      SessionPlayer.onComplete?.();
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// 小節変更ハンドラ（バトンタッチ含む）
+// ---------------------------------------------------------------
+
+/**
+ * 小節が変わったときに呼ばれる。バトンタッチのスケジュールを確認する。
+ * @private
+ */
+function _sessionOnMeasureChange(mi) {
+  const schedule = SessionPlayer.batonSchedule;
+
+  // ─── バトンタッチ処理を先に完了させる ───
+  // タブ譜/ビジュアライザ更新(onMeasureChange)より先に
+  // SessionPlayer.score を新役割スコアに差し替える。
+  // 旧実装は requestAnimationFrame 内で差し替えていたため、
+  // onMeasureChange が古いスコアを参照してタブ譜が更新されなかった。
+  if (schedule && !SessionPlayer._batonBusy) {
+    const entry = schedule[mi];
+    if (entry) {
+      const newUserRole = entry.userRole;
+      if (newUserRole !== SessionPlayer.batonUserRole) {
+        SessionPlayer._batonBusy = true;
+
+        // ① role を即座に確定
+        SessionPlayer.batonUserRole = newUserRole;
+        _sessionApplyMuteFromRole(newUserRole);
+
+        // ② パートナースコアを同期的に差し替え
+        // _originalScore（全声部が揃った元スコア）から再計算することで
+        // ループ2周目以降も正しいスコアが生成される
+        const baseScore = SessionPlayer._originalScore ?? SessionPlayer.score;
+        if (baseScore?._isSessionScore) {
+          const complexity = baseScore._complexity ?? 0.5;
+          const newScore = reapplyBatonRoles(
+            baseScore, newUserRole,
+            baseScore.key ?? 'C', complexity
+          );
+          SessionPlayer.score = newScore;
+        }
+
+        // ③ UI通知（バナー表示）
+        const nextEntry       = schedule[mi + 1];
+        const nextPreviewRole = (nextEntry && nextEntry.userRole !== newUserRole)
+          ? nextEntry.userRole : null;
+        SessionPlayer.onBatonSwitch?.(newUserRole, nextPreviewRole ?? newUserRole);
+
+        SessionPlayer._batonBusy = false;
+      }
+    }
+  }
+
+  // ─── タブ譜/ビジュアライザを最新スコアで更新 ───
+  // この時点で SessionPlayer.score は新役割スコアに差し替え済み
+  SessionPlayer.onMeasureChange?.(mi, SessionPlayer.batonUserRole);
+}
+
+// ---------------------------------------------------------------
+// voice mute ヘルパー
+// ---------------------------------------------------------------
+
+/**
+ * userRole に応じてパートナーの mute を設定する
+ * ユーザーが担当する voice をパートナー再生から除外する
+ *
+ * @param {string} userRole  SESSION_ROLESのキー
+ */
+function _sessionApplyMuteFromRole(userRole) {
+  const voiceToMute = SESSION_ROLES[userRole]?.voice;
+  SessionPlayer.mute = {
+    melody: voiceToMute === 'melody',
+    bass:   voiceToMute === 'bass',
+    inner:  voiceToMute === 'inner',
+  };
+}
+
+// ---------------------------------------------------------------
+// ---------------------------------------------------------------
+// UIコールバック（session_ui.txt が上書きする）
+// ---------------------------------------------------------------
+
+function _sessionUpdateUI(state) {
+  // session_ui.txt で実装。state: 'playing'|'paused'|'stopped'
+  if (typeof sessionUIUpdatePlayerState === 'function') {
+    sessionUIUpdatePlayerState(state);
+  }
+}
+</script>

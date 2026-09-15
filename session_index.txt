@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SessionSpace — ウクレレ・セッション練習</title>
+  <style>
+    /* ======================================================= */
+    /* テーマ変数（現システムの css.txt と互換）                  */
+    /* ======================================================= */
+    :root {
+      --bg: #f7f5f0; --bg2: #eeeae0; --bg3: #e3ddd0;
+      --surface: #fff;
+      --border: rgba(0,0,0,0.1);
+      --text: #2a2820; --text2: #7a7668; --text3: #b0ab9e;
+      --green: #1D9E75; --green-light: #d0f0e4;
+      --blue: #378ADD;  --blue-light: #daeafa;
+      --orange: #D85A30; --orange-light: #fae0d5;
+      --purple: #7F77DD; --purple-light: #e8e6f8;
+      --gray: #888780;
+      --amber: #BA7517; --amber-light: #fdf0d0;
+      --radius: 10px; --radius-lg: 16px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1a1a17; --bg2: #2d2d2a; --bg3: #3d3d3a;
+        --surface: #262623;
+        --border: rgba(255,255,255,0.08);
+        --text: #c2c0b6; --text2: #928f82; --text3: #5f5e5a;
+        --green-light:  #163a2d;
+        --blue-light:   #1a2f4a;
+        --orange-light: #3a1a10;
+        --amber-light:  #2e2005;
+        --purple-light: #1e1c3a;
+      }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, 'Helvetica Neue', sans-serif;
+      background: var(--bg); color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── レイアウト ── */
+    .ss-container {
+      max-width: 720px; margin: 0 auto; padding: 16px;
+    }
+    .ss-header {
+      text-align: center; padding: 20px 0 12px;
+      border-bottom: 1px solid var(--border); margin-bottom: 16px;
+    }
+    .ss-header h1 { font-size: 22px; font-weight: 700; }
+    .ss-header p  { font-size: 13px; color: var(--text2); margin-top: 4px; }
+
+    /* ── セクション ── */
+    .ss-section {
+      background: var(--surface); border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      padding: 14px 16px; margin-bottom: 12px;
+    }
+    .ss-section-title {
+      font-size: 13px; font-weight: 700; color: var(--text2);
+      letter-spacing: 0.05em; margin-bottom: 10px;
+    }
+
+    /* ── セットアップグリッド ── */
+    .ss-setup-grid { display: flex; flex-direction: column; gap: 12px; }
+    .ss-setup-block {}
+    .ss-label {
+      font-size: 11px; font-weight: 700; color: var(--text2);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      margin-bottom: 6px;
+    }
+
+    /* ── ボタン共通 ── */
+    .ss-btn {
+      padding: 6px 12px; border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg2); color: var(--text);
+      font-size: 12px; cursor: pointer; transition: all 0.15s;
+    }
+    .ss-btn:hover  { background: var(--bg3); }
+    .ss-btn.active { background: var(--blue); color: #fff; border-color: var(--blue); }
+    .ss-btn.disabled {
+      opacity: 0.4; cursor: not-allowed; pointer-events: none;
+    }
+    .ss-btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    /* ── 役割ボタン ── */
+    .ss-role-btn {
+      padding: 6px 10px; border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg2); color: var(--text);
+      font-size: 11px; cursor: pointer; transition: all 0.15s;
+    }
+    .ss-role-btn:hover  { background: var(--bg3); }
+    .ss-role-btn.active { background: var(--surface); font-weight: 700; }
+    .ss-role-btn.disabled { opacity: 0.35; cursor: not-allowed; }
+    .ss-role-badge {
+      padding: 6px 10px; border-radius: 8px;
+      background: var(--bg2); font-size: 11px; font-weight: 700;
+    }
+
+    /* ── スタートボタン ── */
+    .ss-primary-btn {
+      padding: 12px 32px; border-radius: 12px;
+      background: var(--green); color: #fff;
+      font-size: 15px; font-weight: 700;
+      border: none; cursor: pointer; transition: opacity 0.15s;
+    }
+    .ss-primary-btn:hover { opacity: 0.85; }
+
+    /* ── コントロールバー ── */
+    .ss-ctrl-btn {
+      width: 36px; height: 36px; border-radius: 50%;
+      background: var(--bg2); border: 1px solid var(--border);
+      font-size: 16px; cursor: pointer; display: flex;
+      align-items: center; justify-content: center;
+    }
+    .ss-ctrl-btn:hover { background: var(--bg3); }
+
+    .ss-mute-btn {
+      padding: 4px 10px; border-radius: 8px;
+      background: var(--bg2); border: 1px solid var(--border);
+      font-size: 14px; cursor: pointer;
+    }
+    .ss-mute-btn.muted {
+      background: var(--orange-light); border-color: var(--orange);
+    }
+
+    /* ── ファイル読み込みボタン ── */
+    .ss-file-btn {
+      display: inline-block; padding: 7px 14px;
+      border-radius: 8px; border: 1px dashed var(--border);
+      background: var(--bg2); color: var(--text);
+      font-size: 12px; cursor: pointer;
+    }
+    .ss-file-btn:hover { background: var(--bg3); }
+
+    /* ── 帯域ビジュアライザ ── */
+    #ss-freq-viz {
+      width: 100%; height: 200px; display: block;
+      border-radius: 8px; overflow: hidden;
+    }
+
+    /* ── ガイド・用語解説 ── */
+    .ss-guide-box {
+      background: var(--blue-light); border: 1px solid var(--blue);
+      border-radius: var(--radius-lg); padding: 12px 14px;
+      margin-bottom: 12px; font-size: 12px; line-height: 1.7;
+      color: var(--text);
+    }
+    .ss-guide-box strong { color: var(--blue); }
+
+    .ss-step-list {
+      counter-reset: step;
+      list-style: none; padding: 0; margin: 8px 0 0;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .ss-step-list li {
+      counter-increment: step;
+      display: flex; align-items: flex-start; gap: 8px;
+      font-size: 12px;
+    }
+    .ss-step-list li::before {
+      content: counter(step);
+      min-width: 20px; height: 20px; border-radius: 50%;
+      background: var(--blue); color: #fff;
+      font-size: 11px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; margin-top: 1px;
+    }
+
+    /* 用語ツールチップ */
+    .ss-term {
+      border-bottom: 1px dashed var(--blue);
+      cursor: help; color: var(--blue); font-weight: 600;
+    }
+
+    /* 用語解説モーダル */
+    #ss-glossary-modal {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.4); z-index: 999;
+      align-items: center; justify-content: center;
+    }
+    #ss-glossary-modal.open { display: flex; }
+    .ss-glossary-inner {
+      background: var(--surface); border-radius: var(--radius-lg);
+      padding: 20px; max-width: 420px; width: 90%;
+      max-height: 80vh; overflow-y: auto;
+      border: 1px solid var(--border);
+    }
+    .ss-glossary-title {
+      font-size: 15px; font-weight: 700; margin-bottom: 12px;
+    }
+    .ss-glossary-item { margin-bottom: 14px; }
+    .ss-glossary-term {
+      font-weight: 700; font-size: 13px; color: var(--blue);
+      margin-bottom: 2px;
+    }
+    .ss-glossary-desc { font-size: 12px; color: var(--text); line-height: 1.6; }
+    .ss-glossary-example {
+      font-size: 11px; color: var(--text2); margin-top: 3px;
+      padding-left: 8px; border-left: 2px solid var(--border);
+    }
+
+    /* ガイド開閉ボタン */
+    .ss-guide-toggle {
+      font-size: 11px; color: var(--blue);
+      background: none; border: none; cursor: pointer;
+      text-decoration: underline; padding: 0; margin-top: 6px;
+    }
+
+    /* バトンタッチバナーの点滅アニメ */
+    @keyframes ss-blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.5; }
+    }
+
+    /* ── レスポンシブ ── */
+    @media (max-width: 480px) {
+      .ss-container { padding: 10px; }
+      .ss-section    { padding: 10px 12px; }
+    }
+
+    /* ── ヒントパネル フェードin ── */
+    .ss-hint-inner {
+      /* opacity は JS側でアニメーション制御 */
+    }
+  </style>
+</head>
+<body>
+<div class="ss-container">
+
+  <!-- ヘッダー -->
+  <div class="ss-header">
+    <h1>🎵 SessionSpace</h1>
+    <p>仮想パートナーに合わせて、自分だけの「間」を即興で弾く練習</p>
+  </div>
+
+  <!-- このアプリの目的ガイド -->
+  <div class="ss-guide-box">
+    <strong>🎯 このアプリでできること</strong><br>
+    仮想パートナー（AIが自動演奏）が先に弾き始め、あなたはその音を聴きながら
+    <strong>被らない音域・タイミング</strong>を即興で弾きます。
+    タブ譜は出しません。「耳で聴いて空き場所を見つける感覚」を鍛えます。
+    <button class="ss-guide-toggle" onclick="ssToggleHowto()">▶ 詳しい使い方を見る</button>
+    <div id="ss-howto" style="display:none;margin-top:10px">
+      <ol class="ss-step-list">
+        <li><strong>楽器・キー・コード進行を選ぶ</strong>（またはMIDIファイルを読み込む）</li>
+        <li><strong>役割を決める</strong> — あなたがメロディを弾くのか、コードを弾くのかを選択する。パートナーは残りの役割を担当します</li>
+        <li><strong>セッション開始</strong> — パートナーが演奏を始めます。タブ譜と帯域マップを見て「パートナーが使っていない音域」を確認する</li>
+        <li><strong>自分の楽器で合わせる</strong> — 帯域マップの緑エリアを狙って演奏。パートナーの音とぶつからないよう「引き算」の感覚で弾く</li>
+        <li><strong>ヒントを参考に</strong> — 画面下のヒントが「A弦ハイフレットのチャンス！」などリアルタイムで案内します</li>
+      </ol>
+      <div style="margin-top:8px;padding:8px;background:var(--amber-light);border-radius:8px;font-size:11px">
+        💡 <strong>MIDIインポートの場合:</strong> 好きな曲のMIDIファイルを読み込むと、その曲をパートナーが弾きます。あなたはその上でアドリブを乗せる練習ができます。
+      </div>
+    </div>
+  </div>
+
+  <!-- 用語解説モーダル -->
+  <div id="ss-glossary-modal" onclick="if(event.target===this)ssCloseGlossary()">
+    <div class="ss-glossary-inner">
+      <div class="ss-glossary-title">📖 音楽用語の解説</div>
+
+      <div class="ss-glossary-item">
+        <div class="ss-glossary-term">コンピング（CHORD_COMP）</div>
+        <div class="ss-glossary-desc">コード（和音）を分散させたり刻んだりして伴奏する演奏スタイル。メロディの邪魔をしないよう音数を絞るのがポイント。</div>
+        <div class="ss-glossary-example">例：メロディが休んでいる拍に短くコードを入れる</div>
+      </div>
+
+      <div class="ss-glossary-item">
+        <div class="ss-glossary-term">オブリガード（OBBLIGATO）</div>
+        <div class="ss-glossary-desc">主旋律と一緒に鳴る「合いの手」的なフレーズ。メロディの隙間を飾る即興的な装飾音。「必須の（obligatory）」という意味の音楽用語。</div>
+        <div class="ss-glossary-example">例：ボーカルが息継ぎする瞬間に短いフレーズを挿し込む</div>
+      </div>
+
+      <div class="ss-glossary-item">
+        <div class="ss-glossary-term">引き算の演奏</div>
+        <div class="ss-glossary-desc">音を足すのではなく「弾かない音・休む場所」を意識する演奏の考え方。2人で演奏するとき、同じ音域を同時に埋めると音がぶつかる。相手が弾いている場所を避けることで全体のサウンドがすっきりする。</div>
+      </div>
+
+      <div class="ss-glossary-item">
+        <div class="ss-glossary-term">周波数帯域マップ</div>
+        <div class="ss-glossary-desc">パートナーが使っている音の高さ（MIDI音高）を色で表した図。オレンジ色はパートナーが占有している帯域、緑色はあなたが弾けるスペース。縦軸が音の高さ（上ほど高音）、横軸が時間（左から右へ進む）。</div>
+      </div>
+
+      <div class="ss-glossary-item">
+        <div class="ss-glossary-term">バトンタッチモード</div>
+        <div class="ss-glossary-desc">数小節ごとにメロディ担当とコード担当を交互に切り替えるモード。役割が変わった瞬間に演奏スタイルをすぐ切り替える「俊敏さ」を鍛える。</div>
+        <div class="ss-glossary-example">例：4小節はあなたがメロディ → 次の4小節はパートナーがメロディ</div>
+      </div>
+
+      <div class="ss-glossary-item">
+        <div class="ss-glossary-term">High-G / Low-G チューニング</div>
+        <div class="ss-glossary-desc">ウクレレの4弦（G弦）の音程の違い。High-Gは高いG音で、Low-Gは低いG音。Low-Gにすると低音域が広がりベースラインも弾けるようになる。</div>
+      </div>
+
+      <div class="ss-glossary-item">
+        <div class="ss-glossary-term">演奏複雑度（シンプル / 標準 / 高密度）</div>
+        <div class="ss-glossary-desc">あなたがどのくらい音を弾くかの宣言。「シンプル」を選ぶとパートナーが厚い伴奏を弾いてくれる。「高密度」を選ぶとパートナーはガイドトーン（3度・7度）だけに絞り、あなたの音と重ならないよう引いてくれる。</div>
+      </div>
+
+      <button onclick="ssCloseGlossary()"
+              style="margin-top:8px;padding:8px 20px;border-radius:8px;
+                     background:var(--blue);color:#fff;border:none;
+                     cursor:pointer;font-size:13px;width:100%">閉じる</button>
+    </div>
+  </div>
+
+  <!-- セットアップパネル -->
+  <div class="ss-section">
+    <div class="ss-section-title">⚙️ セッション設定</div>
+    <div id="ss-setup"><!-- session_ui.txt の _ssRenderSetupPanel() が描画 --></div>
+  </div>
+
+  <!-- 帯域ビジュアライザ -->
+  <div class="ss-section">
+    <div class="ss-section-title">
+      📊 周波数帯域マップ
+      <button onclick="ssOpenGlossary()"
+              style="margin-left:8px;font-size:10px;padding:2px 8px;
+                     border-radius:6px;background:var(--blue-light);
+                     color:var(--blue);border:1px solid var(--blue);cursor:pointer">
+        用語解説 📖
+      </button>
+    </div>
+    <div style="font-size:11px;color:var(--text2);margin-bottom:8px;line-height:1.6">
+      <span style="display:inline-block;width:12px;height:8px;background:var(--orange);opacity:0.55;border-radius:2px;vertical-align:middle;margin-right:4px"></span>パートナー占有帯域（ここは弾かない）
+      <span style="display:inline-block;width:12px;height:8px;background:var(--green);opacity:0.35;border-radius:2px;vertical-align:middle;margin:0 4px 0 10px"></span>あなたが弾けるスペース（ここを狙う）
+      <span style="display:inline-block;width:12px;height:8px;background:var(--blue);opacity:0.15;border-radius:2px;vertical-align:middle;margin:0 4px 0 10px"></span>あなたの楽器の音域
+    </div>
+    <svg id="ss-freq-viz" viewBox="0 0 680 200" preserveAspectRatio="xMidYMid meet"></svg>
+  </div>
+
+  <!-- パートナータブ譜（再生コントロール・ヒントをタブ譜の上に配置） -->
+  <div class="ss-section">
+    <div class="ss-section-title">🎼 パートナーのタブ譜</div>
+    <div style="font-size:11px;color:var(--text2);margin-bottom:8px;line-height:1.6">
+      パートナーが弾いているフレット位置を示します。<strong>あなたの譜面はあえて表示しません</strong> — 帯域マップとヒントを手がかりに、自分で「空き場所」を見つけて弾いてください。
+    </div>
+
+    <!-- ① セッション中ステータスバー -->
+    <div id="ss-status-bar" style="display:none;margin-bottom:8px">
+      <div style="background:var(--bg2);border-radius:10px;padding:8px 12px;
+                  display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <div id="ss-status-role" style="font-size:12px"></div>
+        <div style="width:1px;height:14px;background:var(--border)"></div>
+        <div id="ss-status-mode" style="font-size:12px;color:var(--text2)"></div>
+        <div style="flex:1"></div>
+      </div>
+    </div>
+
+    <!-- ② 再生コントロール -->
+    <div id="ss-player-bar" style="margin-bottom:8px"></div>
+
+    <!-- ③ ヒントパネル -->
+    <div id="ss-hint" style="margin-bottom:8px"></div>
+
+    <!-- ④ バトンタッチバナー -->
+    <div id="ss-baton-banner" style="margin-bottom:8px"></div>
+
+    <!-- ⑤ タブ譜本体 -->
+    <div style="overflow-x:auto">
+      <svg id="ss-tab-svg"
+           viewBox="0 0 680 300"
+           preserveAspectRatio="xMidYMid meet"
+           style="width:100%;min-width:320px;display:block;
+                  background:var(--surface);border-radius:8px">
+      </svg>
+    </div>
+  </div>
+
+</div>
+
+<!-- ======================================================= -->
+<!-- 共有ライブラリ（現システムから include / コピー）         -->
+<!-- GAS環境では下部のコメントブロックを参照して include する  -->
+<!-- ======================================================= -->
+<!--
+  読み込み順（依存関係順）:
+
+  1. js_data.txt           ← KEY_DATA / CHROMATIC / OPEN_IDX /
+                              LOW_POS_FORMS / MOVABLE_CHORDS /
+                              fretToMidi / midiToFretOptions /
+                              getChordStructure
+  2. session_chord_shim.txt ← getChordCandidates / optimizePositions
+                              （js_tabEngine.txt の UI部分を除いた必要関数のみ）
+  3. js_melodyEngine.txt   ← buildScoreFromChords / buildChordMidiSet /
+                              buildScaleMidiSet
+  4. solo_js_engine.txt    ← buildSoloScore / buildBassLine /
+                              buildInnerVoices / selectVoicing
+  5. solo_js_player.txt    ← AudioContext / _pluckUkulele / _fretToFreq /
+                              _buildUkuleleWaves
+  6. js_midiParser.txt     ← parseMidi
+
+  ※ js_tabEngine.txt は include しない
+     （currentStyle / renderTabSection 等の現システムUI変数が衝突するため）
+
+  GAS版（この順序で include する）:
+-->
+  <?!= include('js_data'); ?>
+  <?!= include('js_data_genre_patch'); ?>
+  <?!= include('session_chord_shim'); ?>
+  <?!= include('js_melodyEngine'); ?>
+  <?!= include('solo_js_engine'); ?>
+  <?!= include('solo_js_drawing'); ?>
+  <?!= include('solo_js_player'); ?>
+  <?!= include('js_midiParser'); ?>
+  <?!= include('js_scoreImport'); ?>
+  <?!= include('session_data'); ?>
+  <?!= include('session_engine'); ?>
+  <?!= include('session_player'); ?>
+  <?!= include('session_ui'); ?>
+<!--
+  スタンドアロン版:
+  <script src="js_data.js"></script>
+  <script src="js_data_genre_patch.js"></script>
+  <script src="session_chord_shim.js"></script>
+  <script src="js_melodyEngine.js"></script>
+  <script src="solo_js_engine.js"></script>
+  <script src="solo_js_player.js"></script>
+  <script src="js_midiParser.js"></script>
+  <script src="js_scoreImport.js"></script>
+  <script src="session_data.js"></script>
+  <script src="session_engine.js"></script>
+  <script src="session_player.js"></script>
+  <script src="session_ui.js"></script>
+-->
+
+<!-- SessionSpace 専用スクリプト -->
+<!--
+  <script src="session_data.js"></script>
+  <script src="session_engine.js"></script>
+  <script src="session_player.js"></script>
+  <script src="session_ui.js"></script>
+-->
+
+<script>
+// ── ガイド・用語解説 UI ──
+function ssToggleHowto() {
+  const el  = document.getElementById('ss-howto');
+  const btn = document.querySelector('.ss-guide-toggle');
+  if (!el) return;
+  const open = el.style.display === 'none';
+  el.style.display = open ? 'block' : 'none';
+  if (btn) btn.textContent = open ? '▼ 使い方を閉じる' : '▶ 詳しい使い方を見る';
+}
+function ssOpenGlossary() {
+  const m = document.getElementById('ss-glossary-modal');
+  if (m) m.classList.add('open');
+}
+function ssCloseGlossary() {
+  const m = document.getElementById('ss-glossary-modal');
+  if (m) m.classList.remove('open');
+}
+</script>
+
+<script>
+// ── 初期化（DOMContentLoaded） ──
+document.addEventListener('DOMContentLoaded', () => {
+  if (typeof sessionInit === 'function') sessionInit();
+});
+</script>
+
+</body>
+</html>

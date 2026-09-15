@@ -1,0 +1,246 @@
+<script>
+// ===================================================================
+// session_data.txt  — SessionSpace 定数・楽器プロファイル・役割定義
+//
+// 依存: js_data.txt（CHROMATIC, KEY_DATA, fretToMidi）
+// 参照: session_engine.txt, session_player.txt, session_ui.txt
+// ===================================================================
+
+// ---------------------------------------------------------------
+// 楽器プロファイル
+// ---------------------------------------------------------------
+
+const INSTRUMENT_PROFILES = {
+
+  ukulele_high_g: {
+    label:       'ウクレレ (High-G)',
+    emoji:       '🪗',
+    tuning:      [67, 60, 64, 69],        // G4, C4, E4, A4（MIDI）
+    stringNames: ['G弦', 'C弦', 'E弦', 'A弦'],
+    range:       { min: 60, max: 81 },
+    // 各役割が「担えるか」の制約フラグ
+    roleCapable: {
+      MELODY_HIGH:  true,
+      MELODY_MID:   true,
+      CHORD_COMP:   true,
+      BASS:         false,  // G4=MIDI67が最低音のためベース不可
+      OBBLIGATO:    true,
+      RHYTHM:       true,
+    },
+    bassConstraint: 'none',
+    bassConstraintLabel: 'High-Gチューニングのためベースラインは担当できません',
+  },
+
+  ukulele_low_g: {
+    label:       'ウクレレ (Low-G)',
+    emoji:       '🪗',
+    tuning:      [43, 60, 64, 69],        // G2, C4, E4, A4
+    stringNames: ['G弦', 'C弦', 'E弦', 'A弦'],
+    range:       { min: 43, max: 81 },
+    roleCapable: {
+      MELODY_HIGH:  true,
+      MELODY_MID:   true,
+      CHORD_COMP:   true,
+      BASS:         true,
+      OBBLIGATO:    true,
+      RHYTHM:       true,
+    },
+    bassConstraint: 'limited',
+    bassConstraintLabel: 'G2〜B3の1.5オクターブのみ（制限あり）',
+  },
+
+  piano: {
+    label:       'ピアノ',
+    emoji:       '🎹',
+    tuning:      null,
+    range:       { min: 21, max: 108 },
+    hands: {
+      left:  { range: { min: 21, max: 60 } },
+      right: { range: { min: 48, max: 96 } },
+    },
+    roleCapable: {
+      MELODY_HIGH:  true,
+      MELODY_MID:   true,
+      CHORD_COMP:   true,
+      BASS:         true,
+      OBBLIGATO:    true,
+      RHYTHM:       false,  // ストロークはウクレレ固有
+    },
+    bassConstraint: 'none',
+  },
+};
+
+// ---------------------------------------------------------------
+// 役割定義
+// ---------------------------------------------------------------
+
+const SESSION_ROLES = {
+  MELODY_HIGH: {
+    label:     'メロディ（ハイ）',
+    emoji:     '🎵',
+    midiRange: [72, 81],
+    desc:      'A弦ハイフレット。主旋律を担う最も目立つ声部',
+    color:     'var(--blue)',
+    voice:     'melody',
+  },
+  MELODY_MID: {
+    label:     'メロディ（ミッド）',
+    emoji:     '🎶',
+    midiRange: [64, 76],
+    desc:      'E/C弦中域。対旋律・オクターブ下のメロディ',
+    color:     'var(--blue)',
+    voice:     'melody',
+  },
+  CHORD_COMP: {
+    label:     'コードコンピング',
+    emoji:     '🎸',
+    midiRange: [48, 76],
+    desc:      'コードトーンを複数声部で担う伴奏役',
+    color:     'var(--green)',
+    voice:     'inner',
+  },
+  BASS: {
+    label:     'ベースライン',
+    emoji:     '🔉',
+    midiRange: [36, 60],
+    desc:      '低音域のルート・経過音。High-Gウクレレには不可',
+    color:     'var(--orange)',
+    voice:     'bass',
+  },
+  OBBLIGATO: {
+    label:     'オブリガード',
+    emoji:     '✨',
+    midiRange: [67, 81],
+    desc:      '空き帯域を埋める即興的装飾フレーズ',
+    color:     'var(--amber)',
+    voice:     'melody',
+  },
+  RHYTHM: {
+    label:     'リズム（ストローク）',
+    emoji:     '🥁',
+    midiRange: [60, 81],
+    desc:      'コードストローク。伴奏に徹するリズム役',
+    color:     'var(--text2)',
+    voice:     'inner',
+  },
+};
+
+// ---------------------------------------------------------------
+// 役割排他ルール（Role Mutex）
+// ---------------------------------------------------------------
+
+// mode:
+//   'one_of'                 : どちらか一方のみ選択可
+//   'instrument_constraint'  : 楽器の物理制約で自動ブロック
+//   'warn_if_both'           : 両方選択時に警告を表示
+
+const ROLE_MUTEX_GROUPS = [
+  {
+    id:        'primary_melody',
+    exclusive: ['MELODY_HIGH', 'MELODY_MID'],
+    mode:      'one_of',
+    warnText:  '主旋律はどちらか一方が担当します',
+  },
+  {
+    id:        'bass_capability',
+    exclusive: ['BASS'],
+    mode:      'instrument_constraint',
+    // instruments に含まれる楽器がこの役割を選んだとき制約が発動
+    restrictedInstruments: ['ukulele_high_g'],
+  },
+  {
+    id:        'dual_rhythm',
+    exclusive: ['RHYTHM'],
+    mode:      'warn_if_both',
+    warnText:  '両者が同時にストロークすると音が濁ります。役割を分けることを推奨します',
+  },
+];
+
+// ---------------------------------------------------------------
+// 帯域ビジュアライザ定数
+// ---------------------------------------------------------------
+
+const FREQ_VIZ = {
+  MIDI_MIN:      36,   // 表示下限（C2）
+  MIDI_MAX:      96,   // 表示上限（C7）
+  BEAT_GRID:     [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5],
+  // 各MIDI帯域の色分け
+  ZONE_COLORS: {
+    bass:        'var(--orange)',
+    mid:         'var(--green)',
+    high:        'var(--blue)',
+    partner:     'var(--orange)',
+    free:        'var(--green)',
+    user_range:  'var(--blue)',
+    unavailable: 'var(--bg3)',
+  },
+};
+
+// ---------------------------------------------------------------
+// 練習モード定義
+// ---------------------------------------------------------------
+
+const SESSION_MODES = {
+  free: {
+    label:    '自由練習',
+    emoji:    '🎼',
+    desc:     '役割を自由に設定してセッション練習',
+    baton:    false,
+    scored:   false,
+  },
+  find_space: {
+    label:    '隙間を探せ',
+    emoji:    '🔍',
+    desc:     'パートナーの音域を避けてオブリガードを弾き続ける',
+    baton:    false,
+    scored:   true,
+    defaultUserRole:    'OBBLIGATO',
+    defaultPartnerRole: 'CHORD_COMP',
+  },
+  baton_touch: {
+    label:    'バトンタッチ',
+    emoji:    '🔄',
+    desc:     '小節ごとにメロディ・コンプの役割が入れ替わる',
+    baton:    true,
+    scored:   false,
+    switchEvery: 4,   // 何小節ごとに入れ替えるか（デフォルト）
+  },
+};
+
+// ---------------------------------------------------------------
+// 演奏複雑度（Phase 1: 宣言式）
+// ---------------------------------------------------------------
+
+const COMPLEXITY_PRESETS = {
+  simple: {
+    label:      'シンプル',
+    desc:       '少ない音数でゆったり演奏する',
+    value:      0.2,
+    partnerDesc:'パートナーがフルボイシングで支える',
+  },
+  standard: {
+    label:      '標準',
+    desc:       '通常の演奏密度',
+    value:      0.5,
+    partnerDesc:'パートナーがコアトーン中心のボイシング',
+  },
+  dense: {
+    label:      '高密度',
+    desc:       'コードトーンを多用する演奏',
+    value:      0.8,
+    partnerDesc:'パートナーはガイドトーン(3度・7度)のみに絞る',
+  },
+};
+
+// ---------------------------------------------------------------
+// ピアノ音色パラメータ（Phase 2用、Phase 1ではウクレレ音色を代用）
+// ---------------------------------------------------------------
+
+const PIANO_WAVE_PARAMS = {
+  alpha:       1.2,   // 倍音の豊かさ（ウクレレ1.5〜2.1より小さい＝倍音豊か）
+  bodyBoost2:  1.0,
+  bodyBoost3:  0.9,
+  baseDecay:   0.8,   // 打弦楽器の速い減衰（ウクレレ2.2より速い）
+  fcEnd:       1.8,
+};
+</script>

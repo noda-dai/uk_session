@@ -1,0 +1,326 @@
+<script>
+// ===================================================================
+// js_data_genre_patch.txt
+// GENRE_PRESETS に コード数ガイドと拡張ルールを追加するパッチ
+//
+// solo_index.html の include順で js_data の直後に読み込む。
+// 既存 GENRE_PRESETS を Object.assign で上書き拡張する。
+// ===================================================================
+
+// ---------------------------------------------------------------
+// 曲調ごとのコード数ガイド定義
+// ---------------------------------------------------------------
+
+/**
+ * expandRules:
+ *   各プリセット進行（baseChords）を推奨コード数に拡張するための
+ *   繰り返し・変形ルールを定義する。
+ *
+ *   strategy:
+ *     'repeat'     : baseChords をそのまま繰り返す
+ *     'repeat_var' : baseChords を繰り返しながら末尾にVariation小節を挿入
+ *     'section'    : A-A-B-A 形式のセクション構造を組む
+ *     'develop'    : 前半提示→後半展開（転調的な動き）
+ *
+ *   sectionB:
+ *     'section'/'develop' 戦略で使う「B部分」の追加コード度数列
+ *     (キーに応じて buildExpandedChords() が実コード名に変換)
+ *
+ *   variation:
+ *     'repeat_var' 戦略で末尾に挟む変化コード（度数列）
+ */
+const GENRE_CHORD_GUIDE = {
+  pop: {
+    minChords:         4,
+    recommendedChords: 8,
+    maxChords:         16,
+    guideText:         '4〜8コードが最適。シンプルな繰り返しで盛り上がる。',
+    strategy:          'repeat',
+  },
+  ballad: {
+    minChords:         8,
+    recommendedChords: 16,
+    maxChords:         16,
+    guideText:         '8〜16コードが最適。少ないと音符が足りず曲として成立しにくい。',
+    strategy:          'section',
+    // A: 王道進行ベース、B: VIm始まりで感情的な盛り上がりを作る
+    sectionB:          [9, 5, 0, 7],  // VIm-IV-I-V（度数=半音数）
+  },
+  jazz: {
+    minChords:         4,
+    recommendedChords: 8,
+    maxChords:         16,
+    guideText:         '4〜8コードで十分。II-V-Iの解決感が密なほど映える。',
+    strategy:          'develop',
+    // B部: IVm経由でドミナント感を強める
+    sectionB:          [5, 5, 7, 0],  // IV-IV-V-I
+  },
+  bossa: {
+    minChords:         4,
+    recommendedChords: 8,
+    maxChords:         16,
+    guideText:         '4〜8コードが最適。付点リズムのグルーブには最低4コード必要。',
+    strategy:          'repeat_var',
+    // 変化: VIm→IIm→V7→I で解決感を強調
+    variation:         [9, 2, 7, 0],
+  },
+  folk: {
+    minChords:         3,
+    recommendedChords: 4,
+    maxChords:         8,
+    guideText:         '3〜4コードでOK。シンプルさがフォークの魅力。',
+    strategy:          'repeat',
+  },
+  rock: {
+    minChords:         4,
+    recommendedChords: 8,
+    maxChords:         16,
+    guideText:         '4〜8コードが最適。リフ的な繰り返しがロックらしさを出す。',
+    strategy:          'repeat_var',
+    variation:         [9, 9, 7, 7],  // VIm-VIm-V-V（ため）
+  },
+  rnb: {
+    minChords:         4,
+    recommendedChords: 8,
+    maxChords:         12,
+    guideText:         '4〜8コードが最適。ドリアン系の甘いハーモニーが映える。',
+    strategy:          'repeat_var',
+    variation:         [2, 7, 9, 5],  // IIm-V-VIm-IV
+  },
+  blues: {
+    minChords:         4,
+    recommendedChords: 12,
+    maxChords:         16,
+    guideText:         '12小節ブルース形式が基本。4コードより12コードが本格的。',
+    strategy:          'blues12',     // 専用ストラテジー
+  },
+  hawaiian: {
+    minChords:         4,
+    recommendedChords: 8,
+    maxChords:         16,
+    guideText:         '4〜8コードが最適。繰り返しでアロハなグルーヴが生まれる。',
+    strategy:          'repeat',
+  },
+};
+
+// GENRE_PRESETS にマージ（js_data.txt 側を変更せずパッチ適用）
+Object.keys(GENRE_CHORD_GUIDE).forEach(g => {
+  if (GENRE_PRESETS[g]) {
+    Object.assign(GENRE_PRESETS[g], GENRE_CHORD_GUIDE[g]);
+  }
+});
+
+// ---------------------------------------------------------------
+// コード進行拡張エンジン
+// ---------------------------------------------------------------
+
+/**
+ * プリセット進行の baseChords を、曲調の推奨コード数まで
+ * 音楽的に自然な形で拡張する。
+ *
+ * @param {string[]} baseChords  元のコード進行（例: ['C','G','Am','F']）
+ * @param {string}   key         キー名
+ * @param {string}   genre       GENRE_PRESETSのキー
+ * @param {number}   [targetLen] 目標コード数（省略時はrecommendedChords）
+ * @returns {string[]}           拡張後のコード名配列
+ */
+function expandProgressionForGenre(baseChords, key, genre, targetLen) {
+  const guide = GENRE_PRESETS[genre];
+  if (!guide) return baseChords;
+
+  const target = targetLen ?? guide.recommendedChords ?? baseChords.length * 2;
+  if (baseChords.length >= target) return baseChords.slice(0, target);
+
+  const strategy = guide.strategy ?? 'repeat';
+  const keyDef   = KEY_DEFS.find(d => d.key === key);
+  if (!keyDef) return _repeatFill(baseChords, target);
+
+  switch (strategy) {
+    case 'section':    return _expandSection(baseChords, key, keyDef.idx, guide, target);
+    case 'develop':    return _expandDevelop(baseChords, key, keyDef.idx, guide, target);
+    case 'repeat_var': return _expandRepeatVar(baseChords, key, keyDef.idx, guide, target);
+    case 'blues12':    return _expandBlues12(baseChords, key, keyDef.idx, target);
+    default:           return _repeatFill(baseChords, target);
+  }
+}
+
+/**
+ * 度数（半音数）配列 → コード名配列に変換
+ * @param {number[]} semitons  [0,7,9,5] = I,V,VIm,IV 相当の半音数
+ * @param {number}   keyIdx
+ * @param {string}   keyName
+ * @param {boolean[]} minorFlags  trueの場合マイナーにする
+ * @returns {string[]}
+ */
+function _semisToChords(semis, keyIdx, keyName, minorFlags) {
+  return semis.map((s, i) => {
+    const pc   = (keyIdx + s) % 12;
+    const note = CHROMATIC[pc];
+    const suf  = (minorFlags && minorFlags[i]) ? 'm' : '';
+    return toEnChordName(note, suf, keyName);
+  });
+}
+
+/** 半音数から通常ダイアトニックのsuffix推測（簡易） */
+function _diatonicSuffix(semi) {
+  // major scale degrees: 0,2,4,5,7,9,11
+  // minor degrees: 2(IIm),4(IIIm),9(VIm)
+  return [2, 4, 9].includes(semi % 12) ? 'm' : '';
+}
+
+/**
+ * strategy='section': A-A-B-A のセクション構造
+ * target=8  → A(4) + A(4)
+ * target=12 → A(4) + A(4) + B(4)
+ * target=16 → A(4) + A(4) + B(4) + A(4)
+ */
+function _expandSection(base, key, keyIdx, guide, target) {
+  const A = base.slice(0, 4).concat(
+    base.length < 4 ? base.slice(0, 4 - base.length) : []
+  );
+  // Bセクション: sectionBの度数列からコード生成
+  const B = guide.sectionB
+    ? guide.sectionB.map(s => {
+        const note = CHROMATIC[(keyIdx + s) % 12];
+        const suf  = _diatonicSuffix(s);
+        return toEnChordName(note, suf, key);
+      })
+    : A.map(c => c); // フォールバック
+
+  const sections = [A, A, B, A]; // A-A-B-A
+  const result   = [];
+  for (const sec of sections) {
+    result.push(...sec);
+    if (result.length >= target) break;
+  }
+  // 過不足調整
+  while (result.length < target) result.push(...A);
+  return result.slice(0, target);
+}
+
+/**
+ * strategy='develop': 前半=提示(A)、後半=展開(B)
+ * target=8  → A(4) + B(4)
+ * target=16 → A(4) + A(4) + B(4) + A(4)
+ */
+function _expandDevelop(base, key, keyIdx, guide, target) {
+  const A = base.slice(0, 4).concat(
+    base.length < 4 ? base.slice(0, 4 - base.length) : []
+  );
+  const B = guide.sectionB
+    ? guide.sectionB.map(s => {
+        const note = CHROMATIC[(keyIdx + s) % 12];
+        const suf  = _diatonicSuffix(s);
+        return toEnChordName(note, suf, key);
+      })
+    : [...A].reverse();
+
+  if (target <= 8)  return [...A, ...B].slice(0, target);
+  if (target <= 12) return [...A, ...A, ...B].slice(0, target);
+  return [...A, ...A, ...B, ...A].slice(0, target);
+}
+
+/**
+ * strategy='repeat_var': 基本繰り返しの末尾にVariationを挿入
+ * ABAB... 形式で、BはVariation小節
+ * target=8  → base(4) + var(4)
+ * target=12 → base(4) + var(4) + base(4)
+ * target=16 → base(4) + var(4) + base(4) + var(4)
+ */
+function _expandRepeatVar(base, key, keyIdx, guide, target) {
+  const A = base.slice(0, 4).concat(
+    base.length < 4 ? base.slice(0, 4 - base.length) : []
+  );
+  const B = guide.variation
+    ? guide.variation.map(s => {
+        const note = CHROMATIC[(keyIdx + s) % 12];
+        const suf  = _diatonicSuffix(s);
+        return toEnChordName(note, suf, key);
+      })
+    : A;
+
+  const result = [];
+  let toggle = 0;
+  while (result.length < target) {
+    result.push(...(toggle % 2 === 0 ? A : B));
+    toggle++;
+  }
+  return result.slice(0, target);
+}
+
+/**
+ * strategy='blues12': 12小節ブルース形式
+ * I-I-I-I / IV-IV-I-I / V-IV-I-I(V) の12コード構造
+ * target=12  → 1コーラス
+ * target=24  → 2コーラス
+ */
+function _expandBlues12(base, key, keyIdx, target) {
+  const keyName = KEY_DEFS.find(d => d.idx === keyIdx)?.key || key;
+  // I, IV, V を生成（7thコードでブルースらしさを出す）
+  const I  = toEnChordName(CHROMATIC[keyIdx % 12],         '7', keyName);
+  const IV = toEnChordName(CHROMATIC[(keyIdx + 5) % 12],   '7', keyName);
+  const V  = toEnChordName(CHROMATIC[(keyIdx + 7) % 12],   '7', keyName);
+
+  // 12小節ブルース進行
+  const blues12 = [I, I, I, I, IV, IV, I, I, V, IV, I, V];
+
+  const result = [];
+  while (result.length < target) result.push(...blues12);
+  return result.slice(0, target);
+}
+
+/**
+ * strategy='repeat': 単純繰り返し
+ */
+function _repeatFill(base, target) {
+  const result = [];
+  while (result.length < target) result.push(...base);
+  return result.slice(0, target);
+}
+
+// ---------------------------------------------------------------
+// 推奨コード数ガイドのHTML生成
+// ---------------------------------------------------------------
+
+/**
+ * 曲調選択時に表示するガイドバナーのHTMLを返す
+ * @param {string} genre  GENRE_PRESETSのキー（nullならカスタム）
+ * @param {number} currentCount  現在のコード数
+ * @returns {string} HTML文字列
+ */
+function buildGenreGuideHTML(genre, currentCount) {
+  if (!genre) return '';
+  const g = GENRE_PRESETS[genre];
+  if (!g || !g.minChords) return '';
+
+  const min  = g.minChords;
+  const rec  = g.recommendedChords;
+  const max  = g.maxChords;
+  const ok   = currentCount >= min;
+  const ideal = currentCount >= min && currentCount <= max;
+
+  // 状態に応じたカラー
+  const color = ok ? 'var(--green)' : 'var(--orange)';
+  const bg    = ok ? 'var(--green-light)' : 'var(--orange-light)';
+  const icon  = ok ? '✓' : '!';
+
+  return `
+    <div id="solo-genre-guide" style="
+      background:${bg}; border:1px solid ${color};
+      border-radius:10px; padding:8px 12px;
+      margin-bottom:10px; font-size:11px; color:var(--text);
+      display:flex; align-items:flex-start; gap:8px;">
+      <span style="font-weight:700;color:${color};font-size:13px;line-height:1.4">${icon}</span>
+      <div style="flex:1">
+        <div style="font-weight:700;margin-bottom:2px">${g.label}の推奨コード数：${min}〜${max}個（推奨 ${rec}個）</div>
+        <div style="color:var(--text2)">${g.guideText}</div>
+        ${currentCount < min
+          ? `<div style="margin-top:4px;color:var(--orange);font-weight:700">
+               現在 ${currentCount}個 → あと${min - currentCount}個以上追加するか「推奨コード進行で生成」を使ってください
+             </div>`
+          : `<div style="margin-top:4px;color:var(--green)">現在 ${currentCount}個（${ok ? '✓ 適切です' : ''}）</div>`
+        }
+      </div>
+    </div>`;
+}
+</script>

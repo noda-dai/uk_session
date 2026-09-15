@@ -1,0 +1,197 @@
+<script>
+// ===================================================================
+// session_chord_shim.txt  — コードフォーム解決シム
+//
+// js_tabEngine.txt から SessionSpace に必要な定数・関数だけを切り出したもの。
+// js_tabEngine.txt を丸ごと include すると現システムのUI状態変数
+// （currentStyle / tabChords / renderTabSection 等）と衝突するため、
+// SessionSpace では代わりにこのファイルを include する。
+//
+// 含まれる定数・関数:
+//   LOW_POS_FORMS          — ローポジション固定フォーム定義
+//   getChordCandidates()   — コード名 → フレット候補リスト
+//   optimizePositions()    — 進行全体のフォーム最適化
+//   _avgFret()             — 平均フレット計算（内部用）
+//   _deriveFormFromNotes() — 構成音からフォールバック導出（内部用）
+//   _parseChordNotes()     — コード名 → 構成音変換（内部用）
+//
+// 依存: js_data.txt（MOVABLE_CHORDS, KEY_DATA, CHROMATIC, OPEN_IDX）
+// ===================================================================
+
+// ---------------------------------------------------------------
+// ローポジション固定フォーム定義
+// （js_tabEngine.txt から転記）
+// ---------------------------------------------------------------
+const LOW_POS_FORMS = {
+  // ── メジャー ──
+  'C':  { frets:[0,0,0,3], fingers:[0,0,0,3], label:'C'  },
+  'D':  { frets:[2,2,2,0], fingers:[1,3,2,0], label:'D'  },
+  'E':  { frets:[4,4,4,2], fingers:[3,4,2,1], label:'E'  },
+  'F':  { frets:[2,0,1,0], fingers:[2,0,1,0], label:'F'  },
+  'G':  { frets:[0,2,3,2], fingers:[0,1,3,2], label:'G'  },
+  'A':  { frets:[2,1,0,0], fingers:[2,1,0,0], label:'A'  },
+  'Bb': { frets:[3,2,1,1], fingers:[3,2,1,1], label:'Bb' },
+  'B':  { frets:[4,3,2,2], fingers:[4,3,1,1], label:'B'  },
+  // ── マイナー ──
+  'Am': { frets:[2,0,0,0], fingers:[2,0,0,0], label:'Am' },
+  'Dm': { frets:[2,2,1,0], fingers:[2,3,1,0], label:'Dm' },
+  'Em': { frets:[0,4,3,2], fingers:[0,4,3,1], label:'Em' },
+  'Fm': { frets:[1,0,1,3], fingers:[1,0,2,4], label:'Fm' },
+  'Gm': { frets:[0,2,3,1], fingers:[0,2,4,1], label:'Gm' },
+  'Bm': { frets:[4,2,2,2], fingers:[4,1,2,3], label:'Bm' },
+  // ── セブンス ──
+  'G7': { frets:[0,2,1,2], fingers:[0,2,1,3], label:'G7' },
+  'C7': { frets:[0,0,0,1], fingers:[0,0,0,1], label:'C7' },
+  'D7': { frets:[2,2,2,3], fingers:[1,2,3,4], label:'D7' },
+  'E7': { frets:[1,2,0,2], fingers:[1,2,0,3], label:'E7' },
+  'A7': { frets:[0,1,0,0], fingers:[0,1,0,0], label:'A7' },
+  'F7': { frets:[2,3,1,0], fingers:[2,4,1,0], label:'F7' },
+  'B7': { frets:[2,1,2,2], fingers:[2,1,3,4], label:'B7' },
+  // ── マイナー7th・メジャー7th ──
+  'Am7':   { frets:[0,0,0,0], fingers:[0,0,0,0], label:'Am7'   },
+  'Dm7':   { frets:[2,2,1,0], fingers:[2,3,1,0], label:'Dm7'   },
+  'Em7':   { frets:[0,2,0,2], fingers:[0,2,0,3], label:'Em7'   },
+  'Gm7':   { frets:[0,2,1,1], fingers:[0,3,1,2], label:'Gm7'   },
+  'Fmaj7': { frets:[2,0,1,0], fingers:[2,0,1,0], label:'Fmaj7' },
+  'Cmaj7': { frets:[0,0,0,2], fingers:[0,0,0,2], label:'Cmaj7' },
+  'Gmaj7': { frets:[0,2,2,2], fingers:[0,1,2,3], label:'Gmaj7' },
+  'Amaj7': { frets:[1,1,0,0], fingers:[1,2,0,0], label:'Amaj7' },
+  // ── 9th ──
+  'C9':    { frets:[0,2,0,3], fingers:[0,2,0,4], label:'C9'    },
+  'F9':    { frets:[2,3,1,1], fingers:[2,4,1,1], label:'F9'    },
+  'G9':    { frets:[0,2,1,3], fingers:[0,2,1,4], label:'G9'    },
+};
+
+/**
+ * コード名に対して弾けるフォーム候補リストを返す
+ * @param {string} chordName  コード名（例: 'Am7'）
+ * @param {string} key        キー名（例: 'C'）
+ * @param {string} positionPref  'low' | 'high'
+ * @returns {object[]}  { frets, fingers, source, shapeName, avgFret }[]
+ */
+function getChordCandidates(chordName, key, positionPref) {
+  const candidates = [];
+
+  // 1. ローポジ固定フォーム
+  if (LOW_POS_FORMS[chordName]) {
+    const lp = LOW_POS_FORMS[chordName];
+    candidates.push({
+      frets:     lp.frets,
+      fingers:   lp.fingers,
+      source:    'low',
+      shapeName: 'Open',
+      avgFret:   _avgFret(lp.frets),
+    });
+  }
+
+  // 2. MOVABLE_CHORDSシェイプから探す
+  MOVABLE_CHORDS.shapes.forEach(shape => {
+    const list = shape.chords[key] || [];
+    list.forEach(entry => {
+      if (entry.name === chordName) {
+        candidates.push({
+          frets:     entry.frets,
+          fingers:   shape.fingers,
+          source:    'high',
+          shapeName: shape.shape_name,
+          avgFret:   _avgFret(entry.frets),
+        });
+      }
+    });
+  });
+
+  // 3. 候補がなければ構成音から自動導出（フォールバック）
+  if (candidates.length === 0) {
+    const derived = _deriveFormFromNotes(chordName, key);
+    if (derived) {
+      candidates.push({
+        frets:     derived.frets,
+        fingers:   derived.fingers,
+        source:    'auto',
+        shapeName: 'Auto',
+        avgFret:   _avgFret(derived.frets),
+      });
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * 進行全体の各コードに最適フォームを割り当てる
+ * @param {string[]} chordNames
+ * @param {string}   key
+ * @param {string}   positionPref  'low' | 'high'
+ * @returns {object[]}
+ */
+function optimizePositions(chordNames, key, positionPref) {
+  const resolved = [];
+  let prevAvg = positionPref === 'high' ? 7 : 2;
+
+  for (const name of chordNames) {
+    const candidates = getChordCandidates(name, key, positionPref);
+    if (candidates.length === 0) {
+      resolved.push({ name, frets: [0,0,0,0], fingers: [0,0,0,0],
+                      source: 'unknown', shapeName: '?', avgFret: 0 });
+      continue;
+    }
+    const scored = candidates.map(c => {
+      const dist      = Math.abs(c.avgFret - prevAvg);
+      const prefBonus = (positionPref === 'low'  && c.source === 'low')  ? -1.5 :
+                        (positionPref === 'high' && c.source === 'high') ? -1.5 : 0;
+      return { ...c, score: dist + prefBonus };
+    });
+    scored.sort((a, b) => a.score - b.score);
+    const best = scored[0];
+    resolved.push({ name, ...best });
+    prevAvg = best.avgFret;
+  }
+  return resolved;
+}
+
+// ── 内部ヘルパー ──
+
+function _avgFret(frets) {
+  const pressed = frets.filter(f => f > 0);
+  if (pressed.length === 0) return 0;
+  return pressed.reduce((a, b) => a + b, 0) / pressed.length;
+}
+
+function _deriveFormFromNotes(chordName, key) {
+  const notes = _parseChordNotes(chordName, key);
+  if (!notes || notes.length === 0) return null;
+  const OPEN_IDX_LOCAL = (typeof OPEN_IDX !== 'undefined') ? OPEN_IDX : [7, 0, 4, 9];
+  const frets = OPEN_IDX_LOCAL.map(openIdx => {
+    for (let f = 0; f <= 12; f++) {
+      const n = CHROMATIC[(openIdx + f) % 12];
+      if (notes.includes(n)) return f;
+    }
+    return 0;
+  });
+  return { frets, fingers: [0, 0, 0, 0] };
+}
+
+function _parseChordNotes(chordName, key) {
+  const kd = KEY_DATA[key];
+  if (kd && kd.chords[chordName]) return kd.chords[chordName].notes;
+  for (const k of Object.keys(KEY_DATA)) {
+    const c = KEY_DATA[k].chords[chordName];
+    if (c) return c.notes;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------
+// HTMLエスケープユーティリティ
+// session_ui.txt の ssHandleMidiFile 等で使用
+// ---------------------------------------------------------------
+function _escHtml(str) {
+  if (typeof str !== 'string') return String(str ?? '');
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+</script>

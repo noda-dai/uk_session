@@ -1,0 +1,1689 @@
+<script>
+// ===================================================================
+// js_scoreImport.txt  ― MIDI / JSON → ソロアレンジ変換エンジン v6
+//
+// v5 → v6 の変更:
+//
+//   [Fix-Melody] MIDIインポート時のメロディ欠落・faithful/ukulele同一化バグの修正
+//                + 4つの洗練改善
+//
+//   ─ バグ修正 ─────────────────────────────────────────────────────
+//        原因:
+//          importFromMidi() が measures に melodyBarNotes のみを格納し、
+//          accompBarNotes をコード推定にだけ使って捨てていた。
+//          その結果、buildSoloScoreFromImport() に渡る rawNotes が
+//          メロディチャンネル1本の単音ストリームのみになり、
+//          _separateMelodyAndAccomp() の Union-Find で全音符が
+//          「同時発音なし＝全部melody」と判定 → accomp が空になっていた。
+//          これにより:
+//            1. 'ukulele' と 'faithful' でほぼ同一の出力が生成される
+//            2. 伴奏チャンネルの音符が完全に消えてしまう
+//
+//        修正内容:
+//          1. importFromMidi(): melodyBarNotes と accompBarNotes を
+//             _voiceHint フィールドで区別しつつ同一配列で measures に格納。
+//          2. _separateMelodyAndAccomp(): _voiceHint が付いている場合は
+//             Union-Find をスキップし、チャンネル分離結果を直接使用。
+//          3. buildSoloScoreFromImport(): notesToUse.forEach 内で
+//             _voiceHint === 'accomp' の音符を voice='bass' として出力。
+//             さらに、フレット位置追跡（prevSi/prevFret/prevMidi）を
+//             メロディ音符のみに限定し、伴奏音符が旋律の連続性を
+//             乱さないよう改善。
+//
+//   ─ 洗練改善 ─────────────────────────────────────────────────────
+//        [Polish-1] toBarNote を melody/accomp 用に分離
+//                   伴奏音符の clamp 警告を抑制（UIの警告スパム防止）。
+//                   メロディ音符の警告は引き続き表示。
+//
+//        [Polish-2] _dedupeAccompByBeat() を追加
+//                   MIDIの複数チャンネル由来で同拍に重複する伴奏和音を
+//                   1音に事前解消してから measures に格納。
+//                   ルート音・コード構成音・最低音を優先して選択。
+//                   _optimizeAccompForUkulele() の精度を向上させる。
+//
+//        [Polish-3] _restoreMelodySkeleton() の閾値を 0.5→0.6 に引き上げ
+//                   _voiceHint 導入後は originalMelody が純粋なメロディ音符のみ
+//                   になり retentionRate が上がるため、フォールバックの
+//                   誤発動を防ぐ。骨格復元音に _voiceHint:'melody' を付与。
+//
+//        [Polish-4] _selectMelodyChannel() にリズム分散スコアを追加
+//                   発音タイミングの標準偏差を評価することで、
+//                   均等拍で鳴るコードストローク系チャンネルと
+//                   自由なリズムで動くメロディ系チャンネルの判別精度を向上。
+//
+// v5 以前の変更:
+//   [D1] playMode='direct' の追加
+//   [E1] ukulele_easy モード
+//   [R1〜R7] メロディ保護・マルチトラック・コード推定強化
+//
+// 公開 API（変更なし）:
+//   importFromMidi(arrayBuffer)  → ImportResult
+//   importFromJson(jsonText)     → ImportResult
+//   buildSoloScoreFromImport(importResult, options) → SoloScore
+//     options.playMode: 'faithful' | 'ukulele' | 'ukulele_easy' | 'direct'
+// ===================================================================
+
+// ---------------------------------------------------------------
+// 定数
+// ---------------------------------------------------------------
+
+const IMPORT_MIDI_LOW  = 60;  // C4: ウクレレ最低音
+const IMPORT_MIDI_HIGH = 81;  // A5: ウクレレ最高音（12F）
+
+// [E1-b] easy モードでの音域上限（D5 = MIDI 74、7F以内に収まる音域）
+const EASY_MIDI_CEILING = 74;
+
+const KS_TO_KEY = {
+  '-7': 'B',  '-6': 'Gb', '-5': 'Db', '-4': 'Ab',
+  '-3': 'Eb', '-2': 'Bb', '-1': 'F',
+   '0': 'C',
+   '1': 'G',  '2': 'D',  '3': 'A',  '4': 'E',
+   '5': 'B',  '6': 'Gb', '7': 'Db',
+};
+
+// ---------------------------------------------------------------
+// ウクレレ演奏制約定数
+// ---------------------------------------------------------------
+
+function _maxAccompNotesPerBar(tempo) {
+  if (tempo <= 80)  return 8;
+  if (tempo <= 120) return 6;
+  if (tempo <= 160) return 4;
+  return 3;
+}
+
+// [E1] easy モード用: 伴奏をさらに半減
+function _maxAccompNotesPerBarEasy(tempo) {
+  return Math.max(2, Math.floor(_maxAccompNotesPerBar(tempo) / 2));
+}
+
+function _minAccompSep(tempo) {
+  if (tempo <= 80)  return 0.25;
+  if (tempo <= 120) return 0.375;
+  if (tempo <= 160) return 0.5;
+  return 0.75;
+}
+
+// ---------------------------------------------------------------
+// [R1] メロディ／伴奏分離（Union-Find オーバーラップ方式）
+// ---------------------------------------------------------------
+
+function _separateMelodyAndAccomp(notes) {
+  if (!notes || notes.length === 0) return { melody: [], accomp: [] };
+  if (notes.length === 1) return { melody: [...notes], accomp: [] };
+
+  // [Fix-Melody] _voiceHint が付いている場合（importFromMidi 経由）は
+  // チャンネル分離の結果をそのまま使う。Union-Find より信頼性が高い。
+  const hasVoiceHint = notes.some(n => n._voiceHint);
+  if (hasVoiceHint) {
+    const melody = notes.filter(n => n._voiceHint !== 'accomp').sort((a, b) => a.beat - b.beat);
+    const accomp = notes.filter(n => n._voiceHint === 'accomp').sort((a, b) => a.beat - b.beat);
+    return { melody, accomp };
+  }
+
+  const sorted = [...notes].sort((a, b) => a.beat - b.beat);
+  const n      = sorted.length;
+
+  const parent = Array.from({ length: n }, (_, i) => i);
+  function find(i) {
+    while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+    return i;
+  }
+  function union(i, j) {
+    const ri = find(i), rj = find(j);
+    if (ri !== rj) parent[ri] = rj;
+  }
+
+  for (let i = 0; i < n; i++) {
+    const endI = sorted[i].beat + Math.max(sorted[i].duration, 0.125);
+    for (let j = i + 1; j < n; j++) {
+      if (sorted[j].beat >= endI) break;
+      union(i, j);
+    }
+  }
+
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const root = find(i);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(i);
+  }
+  const sortedGroups = [...groups.values()].sort(
+    (ga, gb) => sorted[ga[0]].beat - sorted[gb[0]].beat
+  );
+
+  const melody = [];
+  const accomp = [];
+
+  for (let gi = 0; gi < sortedGroups.length; gi++) {
+    const group = sortedGroups[gi];
+
+    if (group.length === 1) {
+      melody.push(sorted[group[0]]);
+      continue;
+    }
+
+    const topIdx = group.reduce((best, idx) =>
+      sorted[idx].midi > sorted[best].midi ? idx : best, group[0]);
+    const topNote = sorted[topIdx];
+
+    const nextGroup = sortedGroups[gi + 1];
+    let isPassage = false;
+    if (nextGroup) {
+      const nextTopIdx = nextGroup.reduce((best, idx) =>
+        sorted[idx].midi > sorted[best].midi ? idx : best, nextGroup[0]);
+      const beatGap = sorted[nextTopIdx].beat - topNote.beat;
+      const midiGap = Math.abs(sorted[nextTopIdx].midi - topNote.midi);
+      if (beatGap < 0.5 && midiGap <= 2) isPassage = true;
+    }
+
+    if (isPassage) {
+      group.forEach(idx => melody.push(sorted[idx]));
+    } else {
+      melody.push(topNote);
+      group.forEach(idx => { if (idx !== topIdx) accomp.push(sorted[idx]); });
+    }
+  }
+
+  return { melody, accomp };
+}
+
+// ---------------------------------------------------------------
+// 伴奏最適化（通常 / easy 共用）
+// ---------------------------------------------------------------
+
+// ---------------------------------------------------------------
+// 伴奏同拍重複解消（importFromMidi 前処理）
+// ---------------------------------------------------------------
+
+/**
+ * 複数チャンネル由来の伴奏音符で、同拍（±0.06拍以内）に重複する音符を1音に絞る。
+ *
+ * 選択優先順位:
+ *   1. コードのルート音
+ *   2. コードの構成音（root > stable > color > passing）
+ *   3. 拍頭（beat 1, 3）に近い音
+ *   4. 最低音（ベース感を維持）
+ *
+ * ウクレレは最大4弦なので、同拍に複数の伴奏和音が来ても
+ * 弾ける音数に限りがある。事前に間引くことで
+ * _optimizeAccompForUkulele の精度を高める。
+ *
+ * @param {{ midi, beat, duration }[]} accompNotes
+ * @param {string} chord
+ * @returns {{ midi, beat, duration }[]}
+ */
+function _dedupeAccompByBeat(accompNotes, chord, key) {
+  if (!accompNotes || accompNotes.length === 0) return accompNotes;
+
+  const BEAT_TOLERANCE = 0.06;
+  const sorted = [...accompNotes].sort((a, b) => a.beat - b.beat);
+  const result = [];
+
+  let i = 0;
+  while (i < sorted.length) {
+    // 同拍グループを収集
+    const group = [sorted[i]];
+    let j = i + 1;
+    while (j < sorted.length && Math.abs(sorted[j].beat - sorted[i].beat) < BEAT_TOLERANCE) {
+      group.push(sorted[j]);
+      j++;
+    }
+
+    if (group.length === 1) {
+      result.push(group[0]);
+    } else {
+      // スコアで最良の1音を選択
+      const best = group.reduce((b, n) => {
+        let s = 0;
+        const role = (typeof classifyNote === 'function')
+          ? classifyNote(n.midi, chord, key ?? chord) : 'passing';
+        if (role === 'root')        s += 40;
+        else if (role === 'stable') s += 20;
+        else if (role === 'color')  s += 10;
+        // 最低音ボーナス（ベース感を維持）
+        if (n.midi === Math.min(...group.map(x => x.midi))) s += 15;
+        // duration が長い音を優先
+        s += Math.min(n.duration * 4, 8);
+        return s > b.score ? { note: n, score: s } : b;
+      }, { note: group[0], score: -Infinity });
+      result.push(best.note);
+    }
+
+    i = j;
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------
+function _optimizeAccompForUkulele(accompNotes, chord, key, tempo, easyMode = false) {
+  if (!accompNotes || accompNotes.length === 0) return accompNotes;
+
+  const maxNotes = easyMode ? _maxAccompNotesPerBarEasy(tempo) : _maxAccompNotesPerBar(tempo);
+  const minSep   = _minAccompSep(tempo);
+
+  let ns = [...accompNotes].sort((a, b) => a.beat - b.beat);
+
+  function accompScore(n) {
+    let s = 0;
+    const role = (typeof classifyNote === 'function')
+      ? classifyNote(n.midi, chord, key) : 'passing';
+    if (role === 'root')        s += 30;
+    else if (role === 'stable') s += 20;
+    else if (role === 'color')  s += 10;
+    if (Math.abs(n.beat - 1) < 0.01)      s += 20;
+    else if (Math.abs(n.beat - 3) < 0.01) s += 10;
+    else if (n.beat % 1 === 0)             s += 5;
+    s += Math.min(n.duration * 6, 12);
+    return s;
+  }
+
+  let filtered = [ns[0]];
+  for (let i = 1; i < ns.length; i++) {
+    const prev = filtered[filtered.length - 1];
+    if (ns[i].beat - prev.beat < minSep) {
+      if (accompScore(ns[i]) > accompScore(prev)) filtered[filtered.length - 1] = ns[i];
+    } else {
+      filtered.push(ns[i]);
+    }
+  }
+  ns = filtered;
+
+  if (ns.length > maxNotes) {
+    ns = [...ns]
+      .sort((a, b) => accompScore(b) - accompScore(a))
+      .slice(0, maxNotes)
+      .sort((a, b) => a.beat - b.beat);
+  }
+
+  return ns;
+}
+
+// ---------------------------------------------------------------
+// [R4] メロディ整形（間引きなし）
+// ---------------------------------------------------------------
+
+function _refineMelodyNotes(melodyNotes) {
+  if (!melodyNotes || melodyNotes.length === 0) return melodyNotes;
+
+  const sorted  = [...melodyNotes].sort((a, b) => a.beat - b.beat);
+  const deduped = [];
+  for (const n of sorted) {
+    const last = deduped[deduped.length - 1];
+    if (last && Math.abs(last.beat - n.beat) < 0.06) {  // [fix] 8分音符グリッド誤差を吸収
+      if (n.midi > last.midi) deduped[deduped.length - 1] = n;
+    } else {
+      deduped.push(n);
+    }
+  }
+  return deduped;
+}
+
+// ---------------------------------------------------------------
+// [R2] メロディ duration 延長
+// ---------------------------------------------------------------
+
+function _extendMelodyDurations(melodyNotes, beatsPerBar = 4) {
+  if (!melodyNotes || melodyNotes.length === 0) return melodyNotes;
+
+  const result = melodyNotes.map(n => ({ ...n }));
+  for (let i = 0; i < result.length - 1; i++) {
+    const gap   = result[i + 1].beat - result[i].beat;
+    result[i].duration = Math.min(gap * 0.95, result[i].duration * 1.5, beatsPerBar);
+  }
+  const last = result[result.length - 1];
+  result[result.length - 1] = {
+    ...last,
+    duration: Math.min((beatsPerBar + 1) - last.beat, last.duration * 1.5),
+  };
+  return result;
+}
+
+// ---------------------------------------------------------------
+// [R5] メロディ骨格フォールバック（小節またぎ対応）
+// ---------------------------------------------------------------
+
+function _restoreMelodySkeleton(originalMelody, optimizedMelody, prevMeasureEndBeat) {
+  // [fix-C] voiceHint なし時も accomp 音符を除外して純粋なメロディのみで計算
+  const pureMelody = originalMelody.filter(n => n._voiceHint !== 'accomp');
+  if (pureMelody.length === 0) return optimizedMelody;
+
+  // [R5-refined] 閾値を 0.5→0.6 に引き上げ。
+  // _voiceHint 導入後は originalMelody が純粋なメロディ音符のみになり、
+  // 過去より retentionRate が高くなるため少し厳しくしてフォールバックの誤発動を防ぐ。
+  const retentionRate = optimizedMelody.length / Math.max(pureMelody.length, 1);
+  if (retentionRate >= 0.6) return optimizedMelody;
+
+  const skeletonBeats    = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5];
+  const alreadyUsedBeats = new Set(optimizedMelody.map(n => Math.round(n.beat * 8)));
+  const skeleton         = [];
+
+  for (const targetBeat of skeletonBeats) {
+    const beatKey = Math.round(targetBeat * 8);
+    if (alreadyUsedBeats.has(beatKey)) continue;
+    if (targetBeat === 1 && prevMeasureEndBeat > 0) continue;
+
+    const candidates = pureMelody.filter(n => Math.abs(n.beat - targetBeat) < 0.26);
+    if (candidates.length === 0) continue;
+
+    // 復元した骨格音に _voiceHint を付与してメロディとして扱われることを保証
+    const best = candidates.reduce((a, b) => (b.midi > a.midi ? b : a));
+    skeleton.push({ ...best, _voiceHint: 'melody' });
+    alreadyUsedBeats.add(beatKey);
+  }
+
+  return [...optimizedMelody, ...skeleton].sort((a, b) => a.beat - b.beat);
+}
+
+// ---------------------------------------------------------------
+// [E1] easy モード: メロディ難易度調整
+// ---------------------------------------------------------------
+
+/**
+ * [E1-a] 骨格抽出: 音楽的に重要な音を残し旋律の輪郭を保つ。
+ *
+ * 旧実装は「拍頭に近い音を残す」だけだったため、
+ * 8分音符主体のメロディで原曲の印象が大きく変わる問題があった。
+ *
+ * 新ルール（優先度順）:
+ *   1. 先頭・末尾は必ず保持
+ *   2. 音程の局所的ピーク（前後より高い音）または谷（前後より低い音）を保持
+ *      → メロディの「山・谷」が原曲の印象を最も強く規定するため
+ *   3. 強拍（beat 1, 3 ±0.25拍）および弱拍（beat 2, 4）の音を保持
+ *   4. 最低3音保証: 少なすぎると旋律の方向性が消えるため間隔の広い区間に補充
+ *
+ * @param {{ midi, beat, duration }[]} melodyNotes
+ * @returns {{ midi, beat, duration }[]}
+ */
+function _extractMelodySkeleton(melodyNotes) {
+  if (!melodyNotes || melodyNotes.length <= 3) return melodyNotes;
+
+  const sorted = [...melodyNotes].sort((a, b) => a.beat - b.beat);
+  const n      = sorted.length;
+  const keep   = new Array(n).fill(false);
+
+  // 1. 先頭・末尾は必ず保持
+  keep[0]     = true;
+  keep[n - 1] = true;
+
+  // 2. 局所ピーク・谷を保持（メロディの輪郭を決定する最重要音）
+  for (let i = 1; i < n - 1; i++) {
+    const prev = sorted[i - 1].midi;
+    const curr = sorted[i].midi;
+    const next = sorted[i + 1].midi;
+    if ((curr > prev && curr >= next) || (curr < prev && curr <= next)) {
+      keep[i] = true;
+    }
+  }
+
+  // 3. 全拍頭（1〜4拍）の音を保持（強拍・弱拍ともに骨格として残す）
+  for (const targetBeat of [1, 2, 3, 4]) {
+    let bestIdx = -1, bestDist = Infinity;
+    sorted.forEach((note, i) => {
+      const dist = Math.abs(note.beat - targetBeat);
+      if (dist < 0.26 && dist < bestDist) { bestDist = dist; bestIdx = i; }
+    });
+    if (bestIdx >= 0) keep[bestIdx] = true;
+  }
+
+  // 4. [fix-B] 単調区間補完: 連続する keep=false 区間が3音以上になる場合、
+  //    等間隔で中間音を1音残す。
+  //    C-D-E-F-G のような単調フレーズでD,E,Fが全脱落するのを防ぐ。
+  const keptIndices = keep.map((v, i) => v ? i : -1).filter(i => i >= 0);
+  for (let ki = 0; ki < keptIndices.length - 1; ki++) {
+    const lo = keptIndices[ki];
+    const hi = keptIndices[ki + 1];
+    const gap = hi - lo;   // 間に何音あるか
+    if (gap >= 3) {
+      // 中間インデックスを保持
+      const mid = lo + Math.floor(gap / 2);
+      keep[mid] = true;
+      keptIndices.splice(ki + 1, 0, mid); // 更新して再チェック対象に
+    }
+  }
+
+  let result = sorted.filter((_, i) => keep[i]);
+
+  // 5. 最低3音保証
+  if (result.length < 3) {
+    const kept = sorted.filter((_, i) => keep[i]);
+    let maxGap = 0, gapIdx = -1;
+    for (let i = 0; i < kept.length - 1; i++) {
+      const gap = kept[i + 1].beat - kept[i].beat;
+      if (gap > maxGap) { maxGap = gap; gapIdx = i; }
+    }
+    if (gapIdx >= 0) {
+      const midBeat = (kept[gapIdx].beat + kept[gapIdx + 1].beat) / 2;
+      const fill = sorted.find((note, i) =>
+        !keep[i] && Math.abs(note.beat - midBeat) < 0.5
+      );
+      if (fill) result = [...result, fill].sort((a, b) => a.beat - b.beat);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * [E1-b] 音域平坦化: EASY_MIDI_CEILING を超える音をオクターブ下げる。
+ * 下げた結果が IMPORT_MIDI_LOW を下回る場合はそのままにする（音を消さない）。
+ *
+ * @param {{ midi, beat, duration }[]} melodyNotes
+ * @returns {{ midi, beat, duration }[]}
+ */
+function _flattenMelodyRange(melodyNotes) {
+  return melodyNotes.map(n => {
+    if (n.midi <= EASY_MIDI_CEILING) return n;
+    const lowered = n.midi - 12;
+    if (lowered >= IMPORT_MIDI_LOW) return { ...n, midi: lowered };
+    return n; // 下げると範囲外になる場合は元の音を保持
+  });
+}
+
+/**
+ * [E1-c] 跳躍緩和: 隣接音の間隔が LEAP_THRESHOLD 半音を超える場合に
+ * ダイアトニックな経過音を1音挿入する。
+ *
+ * 経過音の選択:
+ *   上行跳躍（C→G): 上行方向のダイアトニック音を3度上（または最近接）で選択
+ *   下行跳躍（G→C): 下行方向のダイアトニック音を3度下（または最近接）で選択
+ *
+ *   拍位置: 2音の中間 beat に配置
+ *   duration: 0.5拍（装飾的な経過音として扱う）
+ *
+ * @param {{ midi, beat, duration }[]} melodyNotes  beat順ソート済み
+ * @param {string} key
+ * @returns {{ midi, beat, duration }[]}
+ */
+function _smoothMelodyLeaps(melodyNotes, key) {
+  const LEAP_THRESHOLD = 5; // 長3度（5半音）超で緩和を試みる
+
+  if (!melodyNotes || melodyNotes.length < 2) return melodyNotes;
+
+  // キーのダイアトニック音PC集合を構築
+  const keyDef  = (typeof KEY_DEFS !== 'undefined') ? KEY_DEFS.find(d => d.key === key) : null;
+  const rootIdx = keyDef ? keyDef.idx : 0;
+  // 長調スケール半音オフセット
+  const MAJOR_SCALE = [0, 2, 4, 5, 7, 9, 11];
+  const diatonicPCs = new Set(MAJOR_SCALE.map(s => (rootIdx + s) % 12));
+
+  const result = [melodyNotes[0]];
+
+  for (let i = 1; i < melodyNotes.length; i++) {
+    const prev = result[result.length - 1];
+    const curr = melodyNotes[i];
+    const leap  = curr.midi - prev.midi;
+    const absLeap = Math.abs(leap);
+
+    if (absLeap > LEAP_THRESHOLD) {
+      // 経過音のMIDI候補を探す（跳躍方向の中間ダイアトニック音）
+      const step      = leap > 0 ? 1 : -1;
+      let   passMidi  = null;
+
+      // 跳躍の中間付近のダイアトニック音を探す（約半分の距離）
+      const target = prev.midi + Math.round(leap * 0.45);
+      for (let d = 0; d <= absLeap; d++) {
+        const candidate = target + d * step;
+        if (diatonicPCs.has(((candidate % 12) + 12) % 12)) {
+          if (candidate !== prev.midi && candidate !== curr.midi) {
+            passMidi = candidate;
+            break;
+          }
+        }
+        const candidate2 = target - d * step;
+        if (d > 0 && diatonicPCs.has(((candidate2 % 12) + 12) % 12)) {
+          if (candidate2 !== prev.midi && candidate2 !== curr.midi) {
+            passMidi = candidate2;
+            break;
+          }
+        }
+      }
+
+      if (passMidi !== null
+          && passMidi >= IMPORT_MIDI_LOW
+          && passMidi <= IMPORT_MIDI_HIGH) {
+        // 経過音を2音の中間beatに挿入（先行音のdurationを半分に短縮）
+        const passGap  = curr.beat - prev.beat;
+        const passBeat = Math.round((prev.beat + passGap * 0.5) * 8) / 8;
+        // 先行音のdurationを経過音beatの直前まで短縮
+        result[result.length - 1] = {
+          ...prev,
+          duration: Math.min(prev.duration, Math.max(0.25, passGap * 0.45)),
+        };
+        result.push({
+          midi:        passMidi,
+          beat:        passBeat,
+          duration:    Math.max(0.25, passGap * 0.45),
+          _voiceHint: 'melody',  // [fix-A] フレーズ処理で melody として扱われることを保証
+        });
+      }
+    }
+
+    result.push(curr);
+  }
+
+  return result;
+}
+
+/**
+ * [E1] easy モード用メロディ処理のメインエントリ。
+ * E1-a → E1-b → E1-c の順で適用する。
+ *
+ * @param {{ midi, beat, duration }[]} melodyNotes
+ * @param {string} key
+ * @returns {{ midi, beat, duration }[]}
+ */
+function _simplifyMelodyForEasy(melodyNotes, key) {
+  // Step E1-a: 骨格抽出
+  const skeleton   = _extractMelodySkeleton(melodyNotes);
+  // Step E1-b: 音域平坦化
+  const flattened  = _flattenMelodyRange(skeleton);
+  // Step E1-c: 跳躍緩和
+  const smoothed   = _smoothMelodyLeaps(flattened, key);
+
+  return smoothed;
+}
+
+// ---------------------------------------------------------------
+// [Thumb] 親指ピッキング用メロディ処理
+//
+// ukulele_easy（かんたんソロ）の新ロジック。
+// 旧ロジック（_simplifyMelodyForEasy）は保存済み。
+//
+// 設計原則（JSONサンプル解析から導出）:
+//   - フレット選択はウクレレ最適化（ukulele）と同じコストを使用
+//     （親指ピッキングでもフレット移動量は同様に最適化できる）
+//   - メロディ骨格は _extractMelodySkeleton で抽出（改善版）
+//   - 音域は 0〜7F を基準帯域とする（easy より広め、ukulele と同等）
+//   - duration を小節全体まで延長せず、次の音符まで伸ばす（親指で弾いた音が自然に続く）
+// ---------------------------------------------------------------
+
+/**
+ * 親指ピッキング向けのメロディ前処理。
+ * ukulele モードと同じ重複除去・骨格保護を適用する。
+ * （フレット選択コストは呼び出し元の notesToUse.forEach で制御）
+ *
+ * @param {{ midi, beat, duration, _voiceHint? }[]} melodyNotes
+ * @param {string} key
+ * @returns {{ midi, beat, duration, _voiceHint? }[]}
+ */
+function _prepareThumbPickingMelody(melodyNotes, key) {
+  // Step T1: 重複beat除去（ukulele通常と同じ）
+  const refined = _refineMelodyNotes(melodyNotes);
+  // Step T2: 骨格復元（保持率60%未満の場合のみ）
+  const restored = _restoreMelodySkeleton(melodyNotes, refined, -1);
+  // Step T3: duration を次の音符まで自然に伸ばす（過剰延長はしない）
+  //          最大2拍に制限して詰め込みを防ぐ
+  return _extendMelodyDurations(restored, 2);
+}
+
+// ---------------------------------------------------------------
+// 音域補正ユーティリティ
+// ---------------------------------------------------------------
+
+function _clampMidiToUkulele(midi) {
+  let m = midi;
+  while (m < IMPORT_MIDI_LOW)  m += 12;
+  while (m > IMPORT_MIDI_HIGH) m -= 12;
+  if (m < IMPORT_MIDI_LOW || m > IMPORT_MIDI_HIGH) {
+    if (midiToFretOptions(m).length > 0) return m;
+    for (let d = 1; d <= 12; d++) {
+      if (midiToFretOptions(m + d).length > 0) return m + d;
+      if (midiToFretOptions(m - d).length > 0) return m - d;
+    }
+    return null;
+  }
+  return m;
+}
+
+// ---------------------------------------------------------------
+// [R7] コード推定（拍頭重み付け強化版）
+// ---------------------------------------------------------------
+
+function _estimateChordFromNotes(notes, key) {
+  if (!notes || notes.length === 0) return key;
+
+  const pcWeight = new Array(12).fill(0);
+  notes.forEach(n => {
+    const pc      = n.midi % 12;
+    const beatMul = Math.abs(n.beat - 1) < 0.13 ? 4
+                  : Math.abs(n.beat - 3) < 0.13 ? 2
+                  : 1;
+    pcWeight[pc] += n.duration * beatMul;
+  });
+
+  const CHORD_FORMS = [
+    { suffix: '',     semis: [0, 4, 7] },
+    { suffix: 'm',    semis: [0, 3, 7] },
+    { suffix: '7',    semis: [0, 4, 7, 10] },
+    { suffix: 'm7',   semis: [0, 3, 7, 10] },
+    { suffix: 'maj7', semis: [0, 4, 7, 11] },
+    { suffix: 'dim',  semis: [0, 3, 6] },
+  ];
+
+  const NOTE_NAMES_SHARP = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+  const NOTE_NAMES_FLAT  = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
+  const useFlatKey = new Set(['F','Bb','Eb','Ab','Db','Gb']).has(key);
+
+  let bestChord = key, bestScore = -1;
+  for (let root = 0; root < 12; root++) {
+    for (const form of CHORD_FORMS) {
+      const chordPcs = new Set(form.semis.map(s => (root + s) % 12));
+      let score = 0;
+      for (let pc = 0; pc < 12; pc++) {
+        if (chordPcs.has(pc)) score += pcWeight[pc] * 2;
+        else                   score -= pcWeight[pc] * 0.3;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        const rootName = (useFlatKey ? NOTE_NAMES_FLAT : NOTE_NAMES_SHARP)[root];
+        bestChord = rootName + form.suffix;
+      }
+    }
+  }
+  return bestChord;
+}
+
+// ---------------------------------------------------------------
+// キー自動検出
+// ---------------------------------------------------------------
+
+function _detectKey(allMidis) {
+  const MAJOR_PROFILE = [6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88];
+  const pcCount = new Array(12).fill(0);
+  allMidis.forEach(m => { pcCount[m % 12]++; });
+  const KEY_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+  const FLAT_MAP  = { 'C#':'Db','D#':'Eb','F#':'Gb','G#':'Ab','A#':'Bb' };
+  let bestKey = 'C', bestR = -Infinity;
+  for (let root = 0; root < 12; root++) {
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
+    for (let i = 0; i < 12; i++) {
+      const x = MAJOR_PROFILE[i];
+      const y = pcCount[(root + i) % 12];
+      sumX += x; sumY += y; sumXY += x * y; sumX2 += x * x; sumY2 += y * y;
+    }
+    const n   = 12;
+    const num = n * sumXY - sumX * sumY;
+    const den = Math.sqrt((n * sumX2 - sumX**2) * (n * sumY2 - sumY**2));
+    const r   = den > 0 ? num / den : 0;
+    if (r > bestR) { bestR = r; bestKey = KEY_NAMES[root]; }
+  }
+  return FLAT_MAP[bestKey] ?? bestKey;
+}
+
+// ---------------------------------------------------------------
+// [R6] MIDI マルチトラック: メロディチャンネル自動選定
+// ---------------------------------------------------------------
+
+function _selectMelodyChannel(channelMap) {
+  const DRUM_CHANNELS = new Set([9, 10]);
+  const channels = [...channelMap.keys()].filter(ch => !DRUM_CHANNELS.has(ch));
+
+  if (channels.length === 0) return { melodyChannel: -1, accompChannels: [] };
+  if (channels.length === 1) return { melodyChannel: channels[0], accompChannels: [] };
+
+  const scores = channels.map(ch => {
+    const notes = channelMap.get(ch);
+    if (!notes || notes.length === 0) return { ch, score: -Infinity };
+
+    const midis  = notes.map(n => n.midi);
+    const sorted = midis.slice().sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+
+    // 音程変化の平均（旋律は伴奏より音程変化が大きい傾向）
+    let intervalSum = 0;
+    for (let i = 1; i < midis.length; i++) intervalSum += Math.abs(midis[i] - midis[i - 1]);
+    const avgInterval = midis.length > 1 ? intervalSum / (midis.length - 1) : 0;
+
+    // 単音率（同tickに1音のみの割合）—旋律は和音が少ない
+    const tickGroups = new Map();
+    notes.forEach(n => tickGroups.set(n.startTick, (tickGroups.get(n.startTick) ?? 0) + 1));
+    const singleNoteRatio = [...tickGroups.values()].filter(v => v === 1).length / tickGroups.size;
+
+    // 低音割合（ベースは低音が多い）
+    const lowNoteRatio = midis.filter(m => m < 60).length / midis.length;
+
+    // [R6-refined] リズム分散: 発音タイミングのばらつきが大きいほど旋律らしい
+    // 伴奏（コードストローク等）は均等拍に固まる傾向があるため、
+    // 拍頭オフセットの標準偏差で判別する
+    const ticks = notes.map(n => n.startTick);
+    const avgTick = ticks.reduce((a, b) => a + b, 0) / ticks.length;
+    const tickStdDev = Math.sqrt(ticks.reduce((s, t) => s + (t - avgTick) ** 2, 0) / ticks.length);
+    // 正規化: ticksPerBeat が不明なので相対的な値として使用（大きいほど分散）
+    const rhythmDiversity = Math.min(tickStdDev / (avgTick + 1), 1.0);
+
+    const countBonus = (notes.length >= 8 && notes.length <= 300) ? 10
+                     : notes.length < 4 ? -20 : 0;
+
+    const score = median * 2.0
+                + avgInterval * 2.0
+                + singleNoteRatio * 30
+                + rhythmDiversity * 15   // [R6-refined] リズム分散ボーナス
+                - lowNoteRatio * 50
+                + countBonus;
+
+    return { ch, score };
+  });
+
+  scores.sort((a, b) => b.score - a.score);
+  return {
+    melodyChannel:  scores[0].ch,
+    accompChannels: scores.slice(1).map(s => s.ch),
+  };
+}
+
+function _groupByChannel(tracks) {
+  const channelMap = new Map();
+  for (const track of tracks) {
+    const active = {};
+    for (const ev of track) {
+      const key = `${ev.channel}_${ev.note}`;
+      if (ev.type === 'noteOn') {
+        active[key] = ev.tick;
+      } else if (ev.type === 'noteOff') {
+        if (active[key] !== undefined) {
+          const dur = ev.tick - active[key];
+          if (dur > 0) {
+            const ch = ev.channel;
+            if (!channelMap.has(ch)) channelMap.set(ch, []);
+            channelMap.get(ch).push({
+              startTick: active[key],
+              endTick:   ev.tick,
+              midi:      ev.note,
+              channel:   ch,
+            });
+          }
+          delete active[key];
+        }
+      }
+    }
+  }
+  return channelMap;
+}
+
+// ---------------------------------------------------------------
+// MIDI → ImportResult
+// ---------------------------------------------------------------
+
+function importFromMidi(buf) {
+  const warnings = [];
+  let midi;
+  try { midi = parseMidi(buf); }
+  catch (e) { throw new Error('MIDIパース失敗: ' + e.message); }
+
+  const { ticksPerBeat, tracks } = midi;
+  let tempo       = Math.round(60000000 / midi.tempo);
+  let timeSig     = [4, 4];
+  let keyFromMeta = null;
+  let title       = '';
+
+  const metaTrack = tracks[0] ?? [];
+  metaTrack.forEach(ev => {
+    if (ev.type === 'setTempo')       tempo = Math.round(60000000 / ev.tempo);
+    if (ev.type === 'timeSignature')  timeSig = [ev.numerator, ev.denominator];
+    if (ev.type === 'keySignature')   keyFromMeta = KS_TO_KEY[String(ev.sharpsFlats)] ?? 'C';
+    if (ev.type === 'text' && !title) title = ev.text;
+  });
+
+  if (timeSig[0] !== 4)
+    warnings.push(`${timeSig[0]}/${timeSig[1]}拍子を検出。4/4として処理します（拍位置がずれる場合あり）`);
+
+  const channelMap = _groupByChannel(tracks);
+  if (channelMap.size === 0) {
+    warnings.push('ノートイベントが見つかりません');
+    return { title, key: 'C', tempo, measures: [], warnings };
+  }
+
+  const { melodyChannel, accompChannels } = _selectMelodyChannel(channelMap);
+  const melodyRawNotes = melodyChannel >= 0 ? (channelMap.get(melodyChannel) ?? []) : [];
+  const accompRawNotes = accompChannels.flatMap(ch => channelMap.get(ch) ?? []);
+
+  if (melodyRawNotes.length === 0 && accompRawNotes.length === 0) {
+    warnings.push('有効なノートイベントが見つかりません');
+    return { title, key: 'C', tempo, measures: [], warnings };
+  }
+
+  if (channelMap.size > 1) {
+    warnings.push(
+      `${channelMap.size}チャンネルを検出。チャンネル${melodyChannel + 1}をメロディとして使用。` +
+      (accompChannels.length > 0
+        ? `チャンネル${accompChannels.map(c => c + 1).join('・')}はコード推定に活用。` : '')
+    );
+  }
+
+  const allMidis    = [...melodyRawNotes, ...accompRawNotes].map(n => n.midi);
+  const detectedKey = keyFromMeta ?? _detectKey(allMidis);
+  const ticksPerBar = ticksPerBeat * timeSig[0];
+  const lastTick    = [...melodyRawNotes, ...accompRawNotes].reduce((m, n) => Math.max(m, n.endTick), 0);
+  const numBars     = Math.min(Math.ceil(lastTick / ticksPerBar), 64);
+
+  if (numBars === 0) {
+    warnings.push('小節が検出できませんでした');
+    return { title, key: detectedKey, tempo, measures: [], warnings };
+  }
+
+  const measures = [];
+  for (let bi = 0; bi < numBars; bi++) {
+    const barStart = bi       * ticksPerBar;
+    const barEnd   = (bi + 1) * ticksPerBar;
+
+    // メロディ用: clamp 警告を出す
+    const toBarNoteMelody = (n) => {
+      const beatPos = ((n.startTick - barStart) / ticksPerBeat) + 1;
+      const beatDur = (n.endTick - n.startTick) / ticksPerBeat;
+      const clamped = _clampMidiToUkulele(n.midi);
+      if (clamped === null) return null;
+      if (clamped !== n.midi)
+        warnings.push(`小節${bi+1}: MIDI ${n.midi} → ${clamped} にオクターブ補正`);
+      return {
+        midi:     clamped,
+        beat:     Math.round(beatPos * 8) / 8,
+        duration: Math.max(0.25, Math.round(beatDur * 8) / 8),
+      };
+    };
+    // 伴奏用: clamp は行うが警告は出さない（コード推定・伴奏補完が目的のため）
+    const toBarNoteAccomp = (n) => {
+      const beatPos = ((n.startTick - barStart) / ticksPerBeat) + 1;
+      const beatDur = (n.endTick - n.startTick) / ticksPerBeat;
+      const clamped = _clampMidiToUkulele(n.midi);
+      if (clamped === null) return null;
+      return {
+        midi:     clamped,
+        beat:     Math.round(beatPos * 8) / 8,
+        duration: Math.max(0.25, Math.round(beatDur * 8) / 8),
+      };
+    };
+
+    const melodyBarNotes = melodyRawNotes
+      .filter(n => n.startTick >= barStart && n.startTick < barEnd)
+      .map(toBarNoteMelody).filter(Boolean);
+
+    const accompBarNotes = accompRawNotes
+      .filter(n => n.startTick >= barStart && n.startTick < barEnd)
+      .map(toBarNoteAccomp).filter(Boolean);
+
+    const allBarNotes = [...melodyBarNotes, ...accompBarNotes];
+    const chord = _estimateChordFromNotes(
+      allBarNotes.length > 0 ? allBarNotes : melodyBarNotes, detectedKey
+    );
+    // [Fix-Melody] accompBarNotes も notes に含める（voice フラグで区別）
+    // ukulele モードで _separateMelodyAndAccomp が正しく働くよう、
+    // メロディ音符と伴奏音符を同一配列に入れた上で voice を付与する。
+    //
+    // 伴奏の同拍重複を事前に解消: 同beatに複数のaccomp音符がある場合（ピアノコード等）、
+    // ルート音（最低音）のみを残すことでウクレレ向けの伴奏密度を整える。
+    const accompDeduped = _dedupeAccompByBeat(accompBarNotes, chord, detectedKey);
+    const notesWithVoice = [
+      ...melodyBarNotes.map(n => ({ ...n, _voiceHint: 'melody' })),
+      ...accompDeduped.map(n => ({ ...n, _voiceHint: 'accomp' })),
+    ];
+    measures.push({ chord, notes: notesWithVoice });
+  }
+
+  return { title, key: detectedKey, tempo, measures, warnings };
+}
+
+// ---------------------------------------------------------------
+// JSON → ImportResult
+// ---------------------------------------------------------------
+
+// ---------------------------------------------------------------
+// [D2] JSON voice 自動分類
+//
+// playMode='direct' の JSON が voice フィールドを持たない場合（全音符 voice:'melody'）、
+// 以下のヒューリスティックで bass / inner / melody を自動推定する。
+//
+// 分類ルール（親指ピッキング前提）:
+//   1. 同拍(±0.06拍)に2弦以上が鳴っている場合 → コード打音グループ
+//      コード打音グループは以下で分類:
+//        - A弦(si=3) かつ最高フレット音   → melody（上声部メロディ）
+//        - C弦(si=1) かつ拍頭(beat 1,3±0.12) → bass（親指でのルート打ち）
+//        - その他の弦                         → inner（内声コードトーン）
+//   2. 単音(同拍に他弦なし):
+//        - C弦(si=1)かつ拍頭              → bass
+//        - その他                           → melody（旋律的単音）
+//
+// 既に voice が 'bass' または 'inner' として明示されている音符はスキップする。
+//
+// @param {object[]} notes  小節内の音符配列（stringIdx, fret, beat, voice フィールドあり）
+// @returns {object[]}  voice フィールドが付与された音符配列（新配列）
+// ---------------------------------------------------------------
+function _autoClassifyVoices(notes) {
+  if (!notes || notes.length === 0) return notes;
+
+  // 既に全音符に明示的な voice 区別(bass/inner)があればスキップ
+  const hasBassOrInner = notes.some(n => n.voice === 'bass' || n.voice === 'inner');
+  if (hasBassOrInner) return notes;
+
+  const result = notes.map(n => ({ ...n }));
+  const BEAT_TOL = 0.06; // 同拍判定の許容誤差（浮動小数点誤差を含む）
+
+  result.sort((a, b) => a.beat - b.beat);
+
+  result.forEach(note => {
+    // 同拍グループ（自分自身を含む）
+    const group = result.filter(n =>
+      Math.abs(n.beat - note.beat) <= BEAT_TOL
+    );
+
+    const isChordGroup = group.length >= 2;
+    // beat 1 および beat 3 ±0.12 を「拍頭」とみなす
+    const isDownbeat   = Math.abs((note.beat - 1) % 2) < 0.12;
+
+    if (isChordGroup) {
+      // ── コード打音グループ ──
+      // A弦(si=3): グループ内で最高フレットをメロディ、他はinner
+      if (note.stringIdx === 3) {
+        const aGroup = group.filter(n => n.stringIdx === 3);
+        const maxFret = Math.max(...aGroup.map(n => n.fret));
+        note.voice = (note.fret === maxFret) ? 'melody' : 'inner';
+      }
+      // C弦(si=1): 拍頭はbass、それ以外はinner
+      else if (note.stringIdx === 1) {
+        note.voice = isDownbeat ? 'bass' : 'inner';
+      }
+      // G弦(si=0): 常にinner（最低声部コードトーン）
+      else if (note.stringIdx === 0) {
+        note.voice = 'inner';
+      }
+      // E弦(si=2): inner（中声部）
+      else if (note.stringIdx === 2) {
+        note.voice = 'inner';
+      }
+    } else {
+      // ── 単音 ──
+      // C弦かつ拍頭 → bass（単音のベース打ち）
+      if (note.stringIdx === 1 && isDownbeat) {
+        note.voice = 'bass';
+      } else {
+        note.voice = 'melody';
+      }
+    }
+
+    // まだ未設定ならmelodyにフォールバック
+    if (!note.voice) note.voice = 'melody';
+  });
+
+  return result;
+}
+
+function importFromJson(jsonText) {
+  const warnings = [];
+  let parsed;
+  try { parsed = JSON.parse(jsonText); }
+  catch (e) { throw new Error('JSONパース失敗: ' + e.message); }
+
+  if (!Array.isArray(parsed.measures) || parsed.measures.length === 0)
+    throw new Error('"measures" 配列がありません');
+
+  // [D1] direct モード判定: JSON内の playMode フラグを検出
+  const isDirect = parsed.playMode === 'direct';
+
+  const KEY_NORM_JSON = { 'C#':'Db','D#':'Eb','F#':'Gb','G#':'Ab','A#':'Bb','Cb':'B' };
+
+  let detectedKey;
+  if (isDirect) {
+    // direct モード: midi フィールドがない可能性があるため midi 収集はスキップ
+    // key は JSON 指定値を優先、なければ 'C'
+    detectedKey = KEY_NORM_JSON[parsed.key] ?? parsed.key ?? 'C';
+  } else {
+    const allMidis = parsed.measures.flatMap(m =>
+      (m.notes ?? []).map(n => n.midi).filter(Number.isFinite)
+    );
+    const rawKey = parsed.key ?? _detectKey(allMidis);
+    detectedKey  = KEY_NORM_JSON[rawKey] ?? rawKey;
+  }
+
+  const measures = parsed.measures.map((m, mi) => {
+    let notes;
+
+    if (isDirect) {
+      // [D1] direct モード: stringIdx + fret をそのまま保持。
+      // midi がなければ fretToMidi() で補完する。
+      // 音域補正（_clampMidiToUkulele）はかけない。
+      let rawDirect = (m.notes ?? []).map(n => {
+        const si   = n.stringIdx ?? 2;
+        const fret = n.fret      ?? 0;
+        // beat:null は前打音・装飾音として扱う → 直後の拍頭より1/8拍前に補正
+        const rawBeat = n.beat;
+        const beat = (rawBeat === null || rawBeat === undefined)
+          ? 0.875  // beat 1 の直前（7/8拍位置）に配置
+          : Math.max(0.5, rawBeat);
+        const midi = Number.isFinite(n.midi)
+          ? n.midi
+          : (typeof fretToMidi === 'function' ? fretToMidi(si, fret) : 69);
+        return {
+          midi,
+          beat,
+          duration:  Math.max(0.125, n.duration ?? 0.5),
+          // direct 専用フィールド（buildSoloScoreFromImport で使用）
+          stringIdx: si,
+          fret,
+          voice:     n.voice     ?? 'melody',
+          technique: n.technique ?? 'normal',
+          _wasNullBeat: (rawBeat === null || rawBeat === undefined), // [D3] 装飾音フラグ
+        };
+      }).filter(n => n !== null);
+
+      // [D2] voice 自動分類: 全音符が melody の場合のみ bass/inner を推定
+      rawDirect = _autoClassifyVoices(rawDirect);
+
+      notes = rawDirect;
+    } else {
+      // 通常モード: 既存の処理
+      notes = (m.notes ?? []).map(n => {
+        if (!Number.isFinite(n.midi)) return null;
+        const clamped = _clampMidiToUkulele(n.midi);
+        if (clamped === null) return null;
+        if (clamped !== n.midi)
+          warnings.push(`小節${mi+1}: MIDI ${n.midi} → ${clamped} にオクターブ補正`);
+        return {
+          midi:     clamped,
+          beat:     Math.max(1, n.beat ?? 1),
+          duration: Math.max(0.25, n.duration ?? 0.5),
+        };
+      }).filter(Boolean);
+    }
+
+    const chord = m.chord ?? _estimateChordFromNotes(notes, detectedKey);
+    return { chord, notes };
+  });
+
+  return {
+    title:     parsed.title    ?? '',
+    key:       detectedKey,
+    tempo:     parsed.tempo    ?? 100,
+    measures,
+    warnings,
+    // [D1] UI 側で自動モード切替に使うフラグ
+    _playMode: isDirect ? 'direct' : undefined,
+  };
+}
+
+// ---------------------------------------------------------------
+// ImportResult → SoloScore
+// ---------------------------------------------------------------
+
+/**
+ * ImportResult をソロアレンジの SoloScore に変換する。
+ *
+ * playMode:
+ *   'faithful'     原曲の音符をそのまま再現（密度フィルタなし）
+ *   'ukulele'      ウクレレ最適化（メロディ保護 + 伴奏間引き）
+ *   'ukulele_easy' ウクレレ最適化 + 難易度調整
+ *                  メロディを骨格化・音域平坦化・跳躍緩和し、
+ *                  difficulty='low'（メロディ+ベースの2声）で生成。
+ *   'direct'       手動編集JSON 直接出力モード [D1]
+ *                  変換ロジックを一切通さず、JSONの stringIdx/fret/voice/technique を
+ *                  そのまま SoloEvent に変換する。
+ *
+ * フレット選択（faithful / ukulele / ukulele_easy のみ）:
+ *   [R3] 方向性コスト（上行→高フレット優先、下行→低フレット優先）
+ *   [E1] easy モード: 高フレットペナルティ（fret > 5 で +cost）
+ *                    開放弦（fret=0）ボーナス（−2 cost）
+ */
+function buildSoloScoreFromImport(importResult, options = {}) {
+  const { key, tempo, measures } = importResult;
+  const playMode    = options.playMode ?? importResult._playMode ?? 'ukulele';
+  const isEasy      = playMode === 'ukulele_easy';
+  const isDirect    = playMode === 'direct';
+  const isMelodyOnly = playMode === 'melody_only';
+  const isChordOnly  = playMode === 'chord_only';
+  // [Fix-Arranged] フルアレンジモード:
+  //   直接出力JSONをベースにbass/inner自動生成を有効にする。
+  //   isDirect のような「変換スキップ」は行わず、メロディのみ externalMelody として注入し、
+  //   bass/innerはbuildSoloScoreの自動生成に任せる。
+  const isArranged  = playMode === 'ukulele_arranged';
+
+  const chordNames     = measures.map(m => m.chord || key);
+  const externalMelody = [];
+  let prevSi             = 2;
+  let prevFret           = -1;
+  let prevMidi           = -1;
+  let prevMeasureEndBeat = -1;
+  // [Fix-Arranged] isArranged モードでのフレーズ連続性追跡
+  // measures.forEach の外で宣言することで小節をまたいだ弦移動コストを考慮できる
+  let prevSi_arr   = 2;
+  let prevFret_arr = 0;
+
+  measures.forEach((m, mi) => {
+    const rawNotes = m.notes ?? [];
+
+    // ── [D1] direct モード: 変換ロジックをスキップ ──────────────
+    if (isDirect) {
+      rawNotes.forEach(note => {
+        // stringIdx / fret は JSON から直接取得（importFromJson で保持済み）
+        const si   = note.stringIdx ?? 2;
+        const fret = note.fret      ?? 0;
+        const midi = Number.isFinite(note.midi)
+          ? note.midi
+          : (typeof fretToMidi === 'function' ? fretToMidi(si, fret) : 69);
+
+        const technique = note.technique ?? 'normal';
+        const voice     = note.voice     ?? 'melody';
+        const chordName = m.chord        ?? key;
+        const role = (typeof classifyNote === 'function')
+          ? classifyNote(midi, chordName, key) : 'passing';
+
+        // [D3] 装飾音フラグ: beat が null 由来の音符は duration を短く固定し
+        //      emphasis を下げて「前打音」として扱う
+        const isGrace  = note._wasNullBeat === true;
+        const duration = isGrace ? 0.125 : (note.duration ?? 0.5);
+        const emphasis = isGrace ? 0.6   : (['root', 'stable'].includes(role) ? 1.2 : 1.0);
+
+        externalMelody.push(makeSoloEvent({
+          beat:        note.beat,
+          duration,
+          voice,
+          stringIdx:   si,
+          fret,
+          midi,
+          role,
+          technique,
+          playStyle:   'picking',
+          emphasis,
+          _measureIdx: mi,
+        }));
+      });
+      return; // 以降の変換処理をスキップ
+    }
+    // ─────────────────────────────────────────────────────────────
+
+    // ── [Fix-Arranged] ukulele_arranged モード ────────────────────
+    // direct JSONのメロディ音符（voice=melody）だけを externalMelody に注入する。
+    // bass/innerは buildSoloScore の自動生成に任せることで
+    // 「原曲メロディ + 自動伴奏アレンジ」を実現する。
+    //
+    // direct JSONの全音符は voice:'melody' であることが多いため、
+    // ここではフレット/弦をそのまま保持しつつ melody 声部のみを抽出して渡す。
+    if (isArranged) {
+      // [Fix-Arranged-Voice] 'inner' のみ除外。melody/bass/未設定はすべてメロディラインとして扱う。
+      // [Fix-Arranged-Fret] fret/stringIdx の信頼性チェック＆再計算。
+      //   ① MIDIパス: si_orig=null → needResolve=true → 再計算
+      //   ② 壊れたJSON再インポート: fret=0, midi は正しい → mismatch → 再計算
+      //   ③ konan.json 等: fret/si と midi が整合 → そのまま使用
+      // 再計算時は小節をまたいだ前音（prevSi_arr/prevFret_arr）との移動コストで候補選択。
+      //
+      // [Fix-ThumbPicking] 同拍複数弦の高音優先選択:
+      //   インポートパスでは元楽曲のコード打音（例: C弦+A弦を同時に鳴らす）が
+      //   同拍に複数の melody 音符として入ってくる。
+      //   親指1本では同時に非隣接弦をピッキングできないため、
+      //   同拍内（1/8拍グリッド）で最大 MIDI（最高音）の1音のみを残す。
+      //   理由: メロディの骨格は通常ソプラノライン（最高音）なので音楽的に正しい。
+      const arrangedRaw = rawNotes.filter(n => (n.voice ?? 'melody') !== 'inner');
+
+      // 同拍グリッド（1/8拍）ごとに最高音の音符のみを残す
+      const beatBuckets = new Map();
+      arrangedRaw.forEach(note => {
+        const midi_for_sort = Number.isFinite(note.midi)
+          ? note.midi
+          : (note.stringIdx != null && note.fret != null && typeof fretToMidi === 'function'
+              ? fretToMidi(note.stringIdx, note.fret) : 0);
+        const bk = Math.round((note.beat ?? 1) * 8); // 1/8拍グリッドキー
+        if (!beatBuckets.has(bk) || midi_for_sort > beatBuckets.get(bk).midi_for_sort) {
+          beatBuckets.set(bk, { note, midi_for_sort });
+        }
+      });
+      const arrangedFiltered = [...beatBuckets.values()]
+        .sort((a, b) => a.note.beat - b.note.beat)
+        .map(v => v.note);
+
+      arrangedFiltered
+        .forEach(note => {
+          const si_orig   = note.stringIdx ?? null;   // null = 未設定（MIDIパス）
+          const fret_orig = note.fret      ?? null;
+          const midi_val  = Number.isFinite(note.midi)
+            ? note.midi
+            : (si_orig !== null && fret_orig !== null && typeof fretToMidi === 'function'
+                ? fretToMidi(si_orig, fret_orig) : 69);
+
+          let si   = si_orig ?? 2;
+          let fret = fret_orig ?? 0;
+
+          // fret/si の整合性チェック:
+          // si_orig が null（MIDIパス）→ 必ず再計算（NaN防止のため fretToMidi は呼ばない）
+          // si_orig がある（JSONパス）→ fretToMidi(si,fret) と midi_val が不一致なら再計算
+          const needResolve = si_orig === null
+            || (typeof fretToMidi === 'function'
+                && fretToMidi(si_orig, fret_orig ?? 0) !== midi_val);
+
+          if (needResolve && typeof midiToFretOptions === 'function') {
+            const opts = midiToFretOptions(midi_val);
+            if (opts.length > 0) {
+              // 小節をまたいだフレーズの流れを保つ（prevSi_arr/prevFret_arr は forEach 外で宣言）
+              const best = opts.reduce((b, o) => {
+                const costB = Math.abs(b.stringIdx - prevSi_arr) * 3 + Math.abs(b.fret - prevFret_arr);
+                const costO = Math.abs(o.stringIdx - prevSi_arr) * 3 + Math.abs(o.fret - prevFret_arr);
+                return costO < costB ? o : b;
+              });
+              si   = best.stringIdx;
+              fret = best.fret;
+            }
+          }
+
+          prevSi_arr   = si;
+          prevFret_arr = fret;
+
+          const chordName = m.chord ?? key;
+          const role = (typeof classifyNote === 'function')
+            ? classifyNote(midi_val, chordName, key) : 'passing';
+          externalMelody.push(makeSoloEvent({
+            beat:        note.beat,
+            duration:    note.duration ?? 0.5,
+            voice:       'melody',
+            stringIdx:   si,
+            fret,
+            midi:        midi_val,
+            role,
+            technique:   note.technique ?? 'normal',
+            playStyle:   'picking',
+            emphasis:    (['root', 'stable'].includes(role) ? 1.2 : 1.0),
+            _measureIdx: mi,
+          }));
+        });
+      return;
+    }
+    // ─────────────────────────────────────────────────────────────
+
+    let notesToUse;
+
+    // chord_only: メロディ音符を使わない（コード進行のみbuildSoloScoreに渡す）
+    if (isChordOnly) {
+      notesToUse = [];  // メロディ音符は全て無視
+      prevMeasureEndBeat = -1;
+
+    } else if (playMode === 'faithful') {
+      notesToUse = rawNotes;
+      prevMeasureEndBeat = -1;
+
+    } else {
+      // ukulele / ukulele_easy / melody_only 共通: メロディ/伴奏分離
+      const { melody, accomp } = _separateMelodyAndAccomp(rawNotes);
+
+      let processedMelody;
+      if (isEasy) {
+        // [Thumb] 親指ピッキング（かんたんソロ）新ロジック:
+        //   フレット選択は ukulele と同等、メロディ骨格を保ちつつ自然な duration で処理
+        //   旧ロジック(_simplifyMelodyForEasy)は保存済みで削除していない
+        processedMelody = _prepareThumbPickingMelody(melody, key);
+      } else {
+        // ukulele: 重複beat除去のみ [R4]
+        processedMelody = _refineMelodyNotes(melody);
+        // [R5] 骨格復元（必要時のみ）
+        processedMelody = _restoreMelodySkeleton(melody, processedMelody, prevMeasureEndBeat);
+      }
+
+      // [R2] duration延長（両モード共通）
+      const extendedMelody = _extendMelodyDurations(processedMelody, 4);
+
+      // 伴奏間引き（easy はさらに半減）
+      const optimizedAccomp = _optimizeAccompForUkulele(
+        accomp, m.chord ?? key, key, tempo, isEasy
+      );
+
+      notesToUse = [...extendedMelody, ...optimizedAccomp].sort((a, b) => a.beat - b.beat);
+
+      prevMeasureEndBeat = extendedMelody.length > 0
+        ? extendedMelody[extendedMelody.length - 1].beat : -1;
+    }
+
+    // [FP4] フレーズ内の相対的ピーク音を事前計算
+    //   notesToUse 中のメロディ音符の中で最高MIDIを特定し、
+    //   その音がフレーズのクライマックス = 高フレット許容として扱う
+    const melodyMidis = notesToUse
+      .filter(n => n._voiceHint !== 'accomp')
+      .map(n => n.midi);
+    const phraseMaxMidi = melodyMidis.length > 0 ? Math.max(...melodyMidis) : -1;
+    const phraseAvgMidi = melodyMidis.length > 0
+      ? melodyMidis.reduce((s, v) => s + v, 0) / melodyMidis.length : 60;
+
+    notesToUse.forEach(note => {
+      const opts = midiToFretOptions(note.midi);
+      if (opts.length === 0) return;
+
+      // [Fix-Melody] _voiceHint から voice を決定（伴奏音符は 'bass' として扱う）
+      const noteVoice    = note._voiceHint === 'accomp' ? 'bass' : 'melody';
+      const isMelodyNote = noteVoice === 'melody';
+
+      // [FP4] 盛り上がり判定（精緻化版）:
+      //   - フレーズ内最高音 or 平均より2半音以上高い音 = クライマックス
+      //   - 前音より3半音以上の上昇跳躍
+      //   いずれかを満たせば高フレットペナルティを半減して表現的なハイポジを許容
+      const melodyDirection = (isMelodyNote && prevMidi >= 0) ? note.midi - prevMidi : 0;
+      const isClimax = isMelodyNote && (
+        note.midi === phraseMaxMidi ||
+        note.midi >= phraseAvgMidi + 2 ||
+        melodyDirection >= 3
+      );
+
+      // フレット選択コスト
+      // [R3]  方向性ボーナス（メロディ音符のみ）
+      // [FP1] 高フレット段階ペナルティ（ukulele通常: 7F+, easy: 5F+）
+      //       0〜5F = 基準(0)、5〜7F = 微小ペナルティ、7F+ = 段階ペナルティ
+      //       開放弦ボーナス: easy=-2、ukulele=-0.8（積極的な共鳴活用）
+      // [FP2] 高フレット貼り付きからの引き戻し圧力
+      const best = opts.reduce((b, o) => {
+        const moveCost = Math.abs(o.stringIdx - prevSi) * 2
+                       + Math.abs(o.fret - (prevFret < 0 ? o.fret : prevFret));
+
+        // [R3] 方向性ボーナス
+        const dirBonus = (isMelodyNote && melodyDirection > 0 && o.fret > prevFret) ? -1
+                       : (isMelodyNote && melodyDirection < 0 && o.fret < prevFret) ? -1
+                       : 0;
+
+        // [FP1] フレット階層ペナルティ + 開放弦ボーナス
+        // ペナルティ開始を 7F→9F に引き上げ:
+        //   E5(A弦7F), F5(A弦8F) は多くの曲で主旋律の核心音。
+        //   7Fペナルティでは本来の音程が低フレット代替に置き換えられる問題があった。
+        let fretPenalty = 0;
+        if (isMelodyNote) {
+          if (isEasy) {
+            // [Thumb] 親指ピッキング: フレット選択コストは ukulele 通常と同等
+            //   親指ピッキングでもフレット移動量の最適化は同様に有効
+            //   開放弦ボーナスは ukulele より強め（親指は開放弦が弾きやすい）
+            fretPenalty = o.fret === 0 ? -1.5
+                        : o.fret <= 8 ? 0
+                        : o.fret <= 11 ? (o.fret - 8) * 0.5
+                        : (o.fret - 11) * 1.2;
+          } else {
+            // ukulele通常: 0〜8F=基準(ペナルティなし)、9〜11F=微小、12F+=段階的
+            //   開放弦に小さなボーナス（共鳴音を積極活用）
+            //   クライマックス時は12F+のペナルティを半減して表現的なハイポジを許容
+            fretPenalty = o.fret === 0 ? -0.8
+                        : o.fret <= 8 ? 0
+                        : o.fret <= 11 ? (o.fret - 8) * 0.4
+                        : isClimax     ? (o.fret - 11) * 0.5
+                        :                (o.fret - 11) * 1.0;
+          }
+        }
+
+        // [FP2] 高フレット貼り付きからの引き戻し圧力（9F以上が続く場合のみ）
+        const pullbackBonus = (isMelodyNote && prevFret >= 9 && o.fret <= 5) ? -1.5 : 0;
+
+        const total = moveCost + dirBonus + fretPenalty + pullbackBonus;
+        return total < b.cost ? { ...o, cost: total } : b;
+      }, { ...opts[0], cost: Infinity });
+
+      const technique = (typeof assignTechnique === 'function')
+        ? assignTechnique(prevSi, prevFret, best.stringIdx, best.fret)
+        : 'normal';
+
+      const chordName = m.chord ?? key;
+      const role = (typeof classifyNote === 'function')
+        ? classifyNote(note.midi, chordName, key) : 'passing';
+
+      externalMelody.push(makeSoloEvent({
+        beat:        note.beat,
+        duration:    note.duration,
+        voice:       noteVoice,
+        stringIdx:   best.stringIdx,
+        fret:        best.fret,
+        midi:        note.midi,
+        role,
+        technique,
+        playStyle:   'picking',
+        emphasis:    (['root', 'stable'].includes(role) ? 1.2 : 1.0),
+        _measureIdx: mi,
+      }));
+
+      // フレット追跡はメロディ音符のみ（伴奏が旋律の指板追跡を乱さないよう）
+      if (isMelodyNote) {
+        prevSi   = best.stringIdx;
+        prevFret = best.fret;
+        prevMidi = note.midi;
+      }
+    });
+  });
+
+  // [E1] easy / melody_only は difficulty='low' 固定
+  // [D1] direct は difficulty='high' で全声部を通す
+  // 難易度マッピング（ukulele_arranged は isArranged ブロックで先に return済み）
+  const effectiveDifficulty = isMelodyOnly ? 'low'
+                             : isDirect    ? 'high'
+                             : (options.difficulty ?? 'mid');
+
+  // [Fix-Arranged] ukulele_arranged:
+  //   measures.forEachブロックでexternalMelodyへの積み上げ完了後、
+  //   _arrangedMelody/_arrangedChords を付けたシェルスコアを返す。
+  //   呼び出し元（_importGenerateTab）が buildArrangedScore を呼び、
+  //   その内部で buildSoloScore → オブリガード統合 を実行する。
+  if (isArranged) {
+    const shellScore = {
+      key,
+      tempo,
+      chordNames,
+      measures:        [],
+      playMode:        'ukulele_arranged',
+      _arrangedMelody: externalMelody,
+      _arrangedChords: chordNames,
+    };
+    if (importResult.title) shellScore.metadata = { title: importResult.title };
+    return shellScore;
+  }
+
+  // [repair-1] importパスでは _skipPositionBlock を有効にする
+  const score = buildSoloScore(chordNames, key, {
+    ...options,
+    externalMelody: isChordOnly ? null : externalMelody,
+    difficulty:         effectiveDifficulty,
+    _skipPositionBlock: true,
+    _melodyOnly:        isMelodyOnly,
+    _chordOnly:         isChordOnly,
+    _thumbPicking:      isEasy,
+    _directMode:        isDirect,
+  });
+
+  score.tempo    = tempo;
+  score.playMode = playMode;
+  if (importResult.title) score.metadata = { ...score.metadata, title: importResult.title };
+  return score;
+}
+
+// ---------------------------------------------------------------
+// コード編集ユーティリティ（変更なし）
+// ---------------------------------------------------------------
+
+function updateImportChord(result, measureIdx, newChord) {
+  const measures = result.measures.map((m, i) =>
+    i === measureIdx ? { ...m, chord: newChord } : m
+  );
+  return { ...result, measures };
+}
+
+// ---------------------------------------------------------------
+// キートランスポーズ（変更なし）
+// ---------------------------------------------------------------
+
+function transposeImportResult(result, newKey) {
+  const warnings = [];
+  const KEY_NORMALIZE = { 'C#':'Db','D#':'Eb','F#':'Gb','G#':'Ab','A#':'Bb', 'Cb':'B' };
+  const normalizeKey  = (k) => KEY_NORMALIZE[k] ?? k;
+  const fromKey = normalizeKey(result.key);
+  const toKey   = normalizeKey(newKey);
+  const oldKeyDef = KEY_DEFS.find(d => d.key === fromKey);
+  const newKeyDef = KEY_DEFS.find(d => d.key === toKey);
+
+  if (!oldKeyDef || !newKeyDef) {
+    warnings.push(`キー "${!oldKeyDef ? fromKey : toKey}" がキー定義に見つかりません。`);
+    return { result: { ...result, key: toKey }, warnings };
+  }
+
+  let semitones = newKeyDef.idx - oldKeyDef.idx;
+  if (semitones > 6)  semitones -= 12;
+  if (semitones < -6) semitones += 12;
+  if (semitones === 0) return { result: { ...result, key: toKey }, warnings };
+
+  const newMeasures = result.measures.map((m, mi) => {
+    const newNotes = m.notes.map(note => {
+      const shifted = note.midi + semitones;
+      const clamped = _clampMidiToUkulele(shifted);
+      if (clamped === null) {
+        warnings.push(`小節${mi+1}: MIDI ${shifted} を音域内に収められませんでした`);
+        return null;
+      }
+      if (clamped !== shifted)
+        warnings.push(`小節${mi+1}: MIDI ${shifted} → ${clamped} にオクターブ補正`);
+      return { ...note, midi: clamped };
+    }).filter(Boolean);
+    return { chord: _estimateChordFromNotes(newNotes, toKey), notes: newNotes };
+  });
+
+  return { result: { ...result, key: toKey, measures: newMeasures }, warnings };
+}
+
+/**
+ * ukulele_arranged モードの中核。
+ *
+ * 設計方針：「ソロ（標準）＋ウクレレ奏法の最終アレンジ版」
+ *
+ *   Step 1. buildSoloScore で「ソロ（標準）」と同等のスコアを生成する。
+ *           - 原曲メロディ（externalMelody）を注入
+ *           - bass/inner 自動生成・ボイシング最適化・奏法付与をすべて適用
+ *           - difficulty='high' で伴奏密度を最大化
+ *
+ *   Step 2. buildIntegratedScore からオブリガード・アルペジオ内声だけを取り出す。
+ *           - ストローク（m.strokes）はソロタブ譜に不適なので使用しない
+ *           - オブリガード（m.melody の _isObbligato=true なもの）
+ *           - アルペジオ内声（m.innerVoice）
+ *
+ *   Step 3. Step1 のイベントに Step2 の装飾音を追加し、
+ *           resolveStringConflicts で競合解消して統合する。
+ *
+ * js_importUI.txt の _importGenerateTab から呼ばれる
+ * （typeof buildArrangedScore === 'function' ガードで保護済み）。
+ *
+ * @param {string[]}    chordNames      コード名配列
+ * @param {string}      key             キー名
+ * @param {SoloEvent[]} externalMelody  原曲メロディ（buildSoloScoreFromImport が生成）
+ * @param {object}      options         genre / arrangeStyle / tempo
+ * @returns {SoloScore}
+ */
+function buildArrangedScore(chordNames, key, externalMelody, options = {}) {
+  const genre        = options.genre        ?? null;
+  const arrangeStyle = options.arrangeStyle ?? 'standard';
+  const tempo        = options.tempo        ?? 100;
+
+  // ── フォールバック ──────────────────────────────────────────────
+  // js_melodyEngine.txt が未ロードの場合はソロ（標準）と同等で返す
+  if (typeof buildSoloScore !== 'function') {
+    console.warn('[buildArrangedScore] buildSoloScore が未定義。');
+    return { key, tempo, measures: [] };
+  }
+
+  // ── Step 1: ソロ（標準）と同等のスコアを生成 ────────────────────
+  // buildSoloScore に externalMelody を注入して通すことで
+  //   ・bass ライン自動生成
+  //   ・inner ボイス自動生成
+  //   ・selectVoicing によるコードフォーム最適化
+  //   ・applyGenreTechniques による hammer-on/pull-off 等の奏法付与
+  //   ・resolveStringConflicts / applyDifficultyFilter
+  // をすべてソロモードと同じパイプラインで処理する。
+  const soloScore = buildSoloScore(chordNames, key, {
+    genre,
+    arrangeStyle,
+    difficulty:         'high',   // 伴奏密度を最大化
+    externalMelody,
+    _skipPositionBlock: true,     // インポート時はフレット変換スキップ
+  });
+
+  // ── Step 2: オブリガード・アルペジオ内声を取り出す ──────────────
+  // buildIntegratedScore が利用可能な場合のみ実行
+  const extraEvents = []; // 追加する装飾音バッファ
+
+  if (typeof buildIntegratedScore === 'function') {
+    const intScore = buildIntegratedScore(chordNames, key, { genre, arrangeStyle });
+
+    intScore.measures.forEach((m, mi) => {
+
+      // オブリガード: _isObbligato=true の melody ノードのみ抽出
+      // voice='inner'（priority=2）で渡すことで resolveStringConflicts において
+      // 原曲メロディ（melody, priority=0）が必ず優先される。
+      // 描画側では isObbligato=true で半透明表示して主旋律と区別する。
+      (m.melody ?? []).filter(n => n._isObbligato).forEach(n => {
+        if (n.fret == null || n.stringIdx == null) return;
+        extraEvents.push(makeSoloEvent({
+          beat:        n.beat,
+          duration:    n.duration ?? 0.25,
+          voice:       'inner',        // priority=2 → 原曲melodyに競合負けする
+          stringIdx:   n.stringIdx,
+          fret:        n.fret,
+          midi:        n.midi ?? 69,
+          role:        n.role ?? 'passing',
+          technique:   n.technique ?? 'normal',
+          playStyle:   'picking',
+          emphasis:    0.8,
+          isObbligato: true,
+          _measureIdx: mi,
+        }));
+      });
+
+      // アルペジオ内声（m.innerVoice）: genre 指定時のみ生成される
+      // ストロークと重複しない拍に入るコードトーンの1音ずつアルペジオ
+      (m.innerVoice ?? []).forEach(n => {
+        if (n.fret == null || n.stringIdx == null) return;
+        const midi = typeof fretToMidi === 'function'
+          ? fretToMidi(n.stringIdx, n.fret) : (n.midi ?? 60);
+        extraEvents.push(makeSoloEvent({
+          beat:        n.beat,
+          duration:    n.duration ?? 0.25,
+          voice:       'inner',
+          stringIdx:   n.stringIdx,
+          fret:        n.fret,
+          midi,
+          role:        'stable',
+          technique:   'normal',
+          playStyle:   'arpeggio',
+          emphasis:    0.8,
+          _measureIdx: mi,
+        }));
+      });
+    });
+  }
+
+  // ── Step 3: 装飾音を統合して競合解消 ────────────────────────────
+  if (extraEvents.length === 0) {
+    // 追加音なし（genre=null 等）: soloScore をそのまま返す
+    soloScore.playMode = 'ukulele_arranged';
+    soloScore.tempo    = tempo;
+    return soloScore;
+  }
+
+  // soloScore の全イベントを抽出してフラット配列に積み直す
+  const allEvents = [];
+  soloScore.measures.forEach((m, mi) => {
+    (m.events ?? []).forEach(ev => {
+      // _measureIdx が未設定の場合は小節インデックスで補完
+      allEvents.push({ ...ev, _measureIdx: ev._measureIdx ?? mi });
+    });
+  });
+
+  // 装飾音を追加
+  allEvents.push(...extraEvents);
+
+  // 競合解消（melody 優先）
+  const resolved = typeof resolveStringConflicts === 'function'
+    ? resolveStringConflicts(allEvents)
+    : allEvents;
+
+  // 難易度フィルタ（high: 全声部を通す）
+  const filtered = typeof applyDifficultyFilter === 'function'
+    ? applyDifficultyFilter(resolved, 'high')
+    : resolved;
+
+  // soloScore の構造（措置・コード・chordFrets）を再利用して events を差し替え
+  const measures = soloScore.measures.map((m, mi) => ({
+    ...m,
+    events: filtered
+      .filter(ev => (ev._measureIdx ?? 0) === mi)
+      .sort((a, b) => a.beat - b.beat || a.voice.localeCompare(b.voice)),
+  }));
+
+  return {
+    ...soloScore,
+    measures,
+    playMode: 'ukulele_arranged',
+    tempo,
+  };
+}
+</script>

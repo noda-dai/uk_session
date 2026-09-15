@@ -1,0 +1,1447 @@
+<script>
+// ===================================================================
+// session_ui.txt  — SessionSpace UI描画・インタラクション  v2
+//
+// v1 → v2 の変更:
+//   [Fix-Midi]   ssHandleMidiFile / ssStart のMIDI分岐を修正。
+//                パートナーがピアノ以外（ウクレレ同士）でも
+//                importFromMidi → buildSoloScoreFromImport パイプラインを
+//                使うよう変更。旧実装は piano 限定で分岐していた。
+//                取り込んだスコアのテンポを score.tempo から自動取得する。
+//   [Add-Tempo]  _ssRenderPlayerBar にテンポスライダーを追加。
+//                sessionPlayerSetTempo() を呼び出す。
+//   [Add-Seek]   _ssRenderPlayerBar に小節ジャンプボタン（⏮◀▶⏭）を追加。
+//                sessionPlayerSeekToMeasure() / sessionPlayerSeek(0) を呼び出す。
+//   [Fix-Cursor] _ssCalcBeatProgress を measureStartTimes 参照方式に修正。
+//                旧実装は 4*secPerBeat 固定で変拍子/MIDIインポートでずれた。
+//
+// 依存:
+//   session_data.txt   — INSTRUMENT_PROFILES, SESSION_ROLES,
+//                        SESSION_MODES, COMPLEXITY_PRESETS, FREQ_VIZ
+//   session_engine.txt — buildPartnerScore, buildFreqBands,
+//                        generateSpaceHint, buildBatonSchedule,
+//                        resolveRoleMutex, buildSessionScoreFromMidi
+//   session_player.txt — sessionPlayerPlay, sessionPlayerStop,
+//                        sessionPlayerPause, sessionPlayerSetTempo,   ← [Add-Tempo]
+//                        sessionPlayerSeek, sessionPlayerSeekToMeasure, ← [Add-Seek]
+//                        SessionPlayer
+//   js_scoreImport.txt — importFromMidi, buildSoloScoreFromImport    ← [Fix-Midi]
+// ===================================================================
+
+// ---------------------------------------------------------------
+// セッション状態変数
+// ---------------------------------------------------------------
+
+let ssKey              = 'C';
+let ssGenre            = 'pop';
+let ssChords           = ['C', 'Am', 'F', 'G'];
+let ssUserInstrument   = 'ukulele_high_g';
+let ssPartnerInstrument= 'ukulele_low_g';
+let ssUserRole         = 'MELODY_HIGH';
+let ssPartnerRole      = 'CHORD_COMP';
+let ssComplexity       = 'standard';
+let ssMode             = 'free';
+let ssBatonEvery       = 4;
+let ssCurrentScore     = null;
+let ssCurrentMeasure   = 0;
+let ssImportedMidi     = null;  // ArrayBuffer
+let ssTempo            = 100;   // [Add-Tempo] UI管理テンポ（スライダーと同期）
+
+// ---------------------------------------------------------------
+// エントリポイント：セッションパネルの初期描画
+// ---------------------------------------------------------------
+
+function sessionInit() {
+  _ssRenderSetupPanel();   // 内部で _ssBuildRolePanelHTML も呼ばれる
+  _ssRenderFreqViz(null, -1);  // 空の帯域メーターを表示
+}
+
+// ---------------------------------------------------------------
+// セットアップパネル
+// ---------------------------------------------------------------
+
+function _ssRenderSetupPanel() {
+  const wrap = document.getElementById('ss-setup');
+  if (!wrap) return;
+
+  // ── かんたんスタート用: ジャンルを選ぶと推奨値を自動セット ──
+  const _genreQuickBtns = Object.entries(GENRE_PRESETS).map(([k, v]) =>
+    `<button class="ss-btn ${ssGenre === k ? 'active' : ''}"
+             onclick="ssSetGenreQuick('${k}')"
+             title="${v.desc ?? ''}">
+       ${v.emoji ?? ''} ${v.label}
+     </button>`
+  ).join('');
+
+  // 詳細設定パネルの開閉状態
+  const isOpen = wrap._detailOpen ?? false;
+
+  // ── 役割パネルHTML（設定末尾に統合） ──
+  const rolePanelHTML = _ssBuildRolePanelHTML();
+
+  wrap.innerHTML = `
+    <!-- ① かんたんスタート -->
+    <div style="margin-bottom:14px">
+      <div class="ss-label">スタイルを選ぶだけで始められます</div>
+      <div class="ss-btn-row" style="flex-wrap:wrap">
+        ${_genreQuickBtns}
+      </div>
+      <div style="font-size:11px;color:var(--text2);margin-top:5px">
+        ${GENRE_PRESETS[ssGenre]?.desc ?? ''}
+        ${GENRE_PRESETS[ssGenre]?.recommendedChords
+          ? `　推奨コード数: <strong>${GENRE_PRESETS[ssGenre].recommendedChords}個</strong>`
+          : ''}
+      </div>
+    </div>
+
+    <!-- ② 詳細設定アコーディオン -->
+    <div style="margin-bottom:14px">
+      <button onclick="ssToggleDetail()"
+              style="display:flex;align-items:center;gap:6px;
+                     background:none;border:none;cursor:pointer;
+                     font-size:12px;color:var(--blue);padding:0">
+        <span id="ss-detail-arrow">${isOpen ? '▼' : '▶'}</span>
+        詳細設定を変える
+      </button>
+      <div id="ss-detail-panel"
+           style="display:${isOpen ? 'block' : 'none'};
+                  margin-top:12px;padding:12px;
+                  background:var(--bg2);border-radius:10px">
+        <div class="ss-setup-grid">
+
+          <!-- あなたの楽器 -->
+          <div class="ss-setup-block">
+            <div class="ss-label">あなたの楽器</div>
+            <div class="ss-btn-row">
+              ${['ukulele_high_g','ukulele_low_g'].map(k => {
+                const v = INSTRUMENT_PROFILES[k];
+                return `<button class="ss-btn ${ssUserInstrument === k ? 'active' : ''}"
+                         onclick="ssSetUserInstrument('${k}')">${v.emoji} ${v.label}</button>`;
+              }).join('')}
+            </div>
+          </div>
+
+          <!-- パートナーの楽器 -->
+          <div class="ss-setup-block">
+            <div class="ss-label">パートナーの楽器</div>
+            <div class="ss-btn-row">
+              ${['ukulele_high_g','ukulele_low_g'].map(k => {
+                const v = INSTRUMENT_PROFILES[k];
+                return `<button class="ss-btn ${ssPartnerInstrument === k ? 'active' : ''}"
+                         onclick="ssSetPartnerInstrument('${k}')">${v.emoji} ${v.label}</button>`;
+              }).join('')}
+            </div>
+            <div style="font-size:11px;color:var(--text2);margin-top:4px">
+              ${ssPartnerInstrument === 'ukulele_low_g'
+                ? 'Low-Gはベースラインも担当できます。'
+                : 'High-Gは標準チューニング。'}
+            </div>
+          </div>
+
+          <!-- MIDIインポート -->
+          <div class="ss-setup-block">
+            <div class="ss-label">曲のMIDIインポート（任意）</div>
+            <label class="ss-file-btn">
+              📂 MIDIファイルを読み込む
+              <input type="file" accept=".mid,.midi" onchange="ssHandleMidiFile(event)" style="display:none">
+            </label>
+            <div id="ss-midi-status" style="font-size:11px;color:var(--text2);margin-top:4px"></div>
+          </div>
+
+          <!-- キー選択 -->
+          <div class="ss-setup-block">
+            <div class="ss-label">キー</div>
+            <div class="ss-btn-row" style="flex-wrap:wrap">
+              ${['C','D','E','F','G','A','B','Bb'].map(k =>
+                `<button class="ss-btn ${ssKey === k ? 'active' : ''}"
+                         onclick="ssSetKey('${k}')">${k}</button>`
+              ).join('')}
+            </div>
+          </div>
+
+          <!-- コード進行 -->
+          <div class="ss-setup-block">
+            <div class="ss-label">コード進行</div>
+            <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px">
+              ${(typeof PROGRESSIONS !== 'undefined' && PROGRESSIONS[ssKey]
+                ? PROGRESSIONS[ssKey] : []
+              ).map(p => {
+                const isSelected = ssChords.join(' ') === p.chords.join(' ');
+                return `<button class="ss-btn ${isSelected ? 'active' : ''}"
+                          onclick="ssApplyProgression('${p.chords.join(',')}')"
+                          title="${p.desc ?? ''}">${p.emoji ?? ''} ${p.label}</button>`;
+              }).join('')}
+            </div>
+            ${(() => {
+              const guide = GENRE_PRESETS[ssGenre];
+              const rec   = guide?.recommendedChords;
+              const cur   = ssChords.length;
+              if (!rec || cur >= rec) return '';
+              return `<div style="margin-bottom:6px">
+                <button class="ss-btn" onclick="ssExpandChords()"
+                  style="background:var(--green-light);border-color:var(--green);color:var(--green)">
+                  ✨ ${guide.label}向けに${rec}コードへ拡張
+                </button>
+                <span style="font-size:11px;color:var(--text2);margin-left:6px">
+                  現在${cur}コード → ${rec}コード推奨
+                </span></div>`;
+            })()}
+            <input type="text" id="ss-chord-text"
+                   value="${ssChords.join(' ')}"
+                   placeholder="例: C Am F G"
+                   style="width:100%;padding:6px 8px;border-radius:8px;
+                          border:1px solid var(--border);
+                          background:var(--surface);color:var(--text);
+                          font-size:13px"
+                   oninput="ssSetChords(this.value)">
+            <div style="font-size:10px;color:var(--text3);margin-top:3px">
+              プリセットを選択するか、コード名をスペース区切りで直接入力
+            </div>
+          </div>
+
+          <!-- 演奏スタイル（複雑度） -->
+          <div class="ss-setup-block">
+            <div class="ss-label">あなたの演奏スタイル</div>
+            <div class="ss-btn-row">
+              ${Object.entries(COMPLEXITY_PRESETS).map(([k, v]) =>
+                `<button class="ss-btn ${ssComplexity === k ? 'active' : ''}"
+                         onclick="ssSetComplexity('${k}')"
+                         title="${v.desc}">${v.label}</button>`
+              ).join('')}
+            </div>
+            <div id="ss-complexity-desc" style="font-size:11px;color:var(--text2);margin-top:4px">
+              ${COMPLEXITY_PRESETS[ssComplexity].partnerDesc}
+            </div>
+          </div>
+
+          <!-- 練習モード -->
+          <div class="ss-setup-block">
+            <div class="ss-label">練習モード</div>
+            <div class="ss-btn-row">
+              ${Object.entries(SESSION_MODES).map(([k, v]) =>
+                `<button class="ss-btn ${ssMode === k ? 'active' : ''}"
+                         onclick="ssSetMode('${k}')"
+                         title="${v.desc}">${v.emoji} ${v.label}</button>`
+              ).join('')}
+            </div>
+            <div id="ss-mode-desc" style="font-size:11px;color:var(--text2);margin-top:4px">
+              ${SESSION_MODES[ssMode].desc}
+            </div>
+            <div id="ss-baton-row" style="display:${ssMode === 'baton_touch' ? 'flex' : 'none'};
+                 align-items:center;gap:8px;margin-top:6px">
+              <span style="font-size:12px">切り替え間隔：</span>
+              ${[2, 4, 8].map(n =>
+                `<button class="ss-btn ${ssBatonEvery === n ? 'active' : ''}"
+                         onclick="ssBatonEvery=${n};_ssRenderSetupPanel()">${n}小節</button>`
+              ).join('')}
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ③ 役割分担（設定末尾に統合） -->
+    <div style="margin-bottom:14px">
+      <div class="ss-label" style="margin-bottom:8px">🎭 役割分担</div>
+      <div id="ss-role-panel-inline">
+        ${rolePanelHTML}
+      </div>
+    </div>
+
+    <!-- ④ セッション開始ボタン（最後に配置） -->
+    <div style="text-align:center;margin-top:6px">
+      <button class="ss-primary-btn" onclick="ssStart()">
+        ▶ セッション開始
+      </button>
+    </div>`;
+
+  // DOM構築後に開閉フラグを復元
+  wrap._detailOpen = isOpen;
+}
+
+/**
+ * かんたんスタート: ジャンル選択のみで推奨値を自動セット
+ * キー・コード・複雑度・役割をジャンルの推奨値で上書きする
+ */
+function ssSetGenreQuick(genre) {
+  ssGenre = genre;
+  const preset = GENRE_PRESETS[genre];
+
+  // テンポ反映
+  if (preset?.tempo) {
+    ssTempo = preset.tempo;
+    if (typeof sessionUIUpdateTempo === 'function') sessionUIUpdateTempo(ssTempo);
+  }
+
+  // キーを C に統一（シンプルスタート）
+  ssKey = 'C';
+
+  // キーに対応するプリセット進行の最初のものを適用
+  if (typeof PROGRESSIONS !== 'undefined' && PROGRESSIONS[ssKey]?.length > 0) {
+    ssChords = PROGRESSIONS[ssKey][0].chords;
+  }
+
+  // 複雑度をstandard固定
+  ssComplexity = 'standard';
+
+  // 役割をデフォルト（MELODY_HIGH）に戻す
+  ssUserRole = 'MELODY_HIGH';
+
+  // _ssRenderSetupPanel 内で _ssBuildRolePanelHTML も呼ばれるため1回で十分
+  _ssRenderSetupPanel();
+}
+
+/**
+ * 詳細設定アコーディオンの開閉
+ */
+function ssToggleDetail() {
+  const wrap = document.getElementById('ss-setup');
+  if (!wrap) return;
+  wrap._detailOpen = !wrap._detailOpen;
+  const panel = document.getElementById('ss-detail-panel');
+  const arrow = document.getElementById('ss-detail-arrow');
+  if (panel) panel.style.display = wrap._detailOpen ? 'block' : 'none';
+  if (arrow) arrow.textContent   = wrap._detailOpen ? '▼' : '▶';
+}
+
+/**
+ * 役割パネルのHTMLを文字列で構築（ss-setup 内の inline 版）
+ */
+function _ssBuildRolePanelHTML() {
+  const userProf = INSTRUMENT_PROFILES[ssUserInstrument];
+  const { partnerRole, warnings } = resolveRoleMutex(
+    ssUserRole, ssUserInstrument, ssPartnerInstrument
+  );
+  ssPartnerRole = partnerRole;
+
+  const userRoleInfo    = SESSION_ROLES[ssUserRole];
+  const partnerRoleInfo = SESSION_ROLES[partnerRole];
+
+  const ROLE_PLAYING_IMAGE = {
+    MELODY_HIGH: {
+      you:     'A弦の5〜12フレット付近で主旋律を弾く。最もよく聴こえる声部。',
+      partner: 'コードを刻みながら低〜中音域で支える。',
+      tip:     '単音でも成り立ちます。音を詰め込まず「間」を大切に。',
+    },
+    MELODY_MID: {
+      you:     'E弦・C弦の中音域でオクターブ下のメロディや対旋律を弾く。',
+      partner: '高音域でオブリガードや装飾を入れながら支える。',
+      tip:     '主旋律より音数を減らして、ハモり感を出すとよい。',
+    },
+    CHORD_COMP: {
+      you:     'コードトーンを1〜2音ずつ散らして弾く。',
+      partner: '主旋律を弾く。あなたはその「土台」になる。',
+      tip:     '拍頭だけ弾いて、残りは休む — それが引き算コンピング。',
+    },
+    BASS: {
+      you:     'G弦（Low-G）でルート音や経過音をゆったり弾く。',
+      partner: '上の音域でメロディ+コードを担当する。',
+      tip:     '1〜2小節に1〜2音で十分。多く弾くほど音が濁る。',
+    },
+    OBBLIGATO: {
+      you:     'パートナーの合間を狙って短いフレーズを差し込む即興演奏。',
+      partner: 'コードを厚めに弾き、隙間を作ってくれる。',
+      tip:     '帯域マップの緑エリアが出たタイミングだけ弾く。',
+    },
+    RHYTHM: {
+      you:     'コードストロークでリズムを刻む。メロディは弾かない。',
+      partner: '主旋律を担当する。あなたはビートを守ることに集中。',
+      tip:     'ダウンストローク中心でシンプルに。',
+    },
+  };
+
+  const img = ROLE_PLAYING_IMAGE[ssUserRole] ?? {};
+
+  const roleBtns = Object.entries(SESSION_ROLES).map(([k, v]) => {
+    const capable  = userProf?.roleCapable[k] !== false;
+    const isActive = ssUserRole === k;
+    return `<button
+      class="ss-role-btn ${isActive ? 'active' : ''} ${!capable ? 'disabled' : ''}"
+      onclick="${capable ? `ssSetUserRoleInline('${k}')` : ''}"
+      title="${capable ? v.desc : (userProf?.bassConstraintLabel ?? '担当不可')}"
+      style="border-left:3px solid ${capable ? v.color : 'var(--bg3)'}">
+      ${v.emoji} ${v.label}
+      ${!capable ? '<span style="font-size:9px;opacity:0.6"> 不可</span>' : ''}
+    </button>`;
+  }).join('');
+
+  const detailCard = userRoleInfo ? `
+    <div style="background:var(--bg2);border-radius:10px;padding:12px 14px;margin-top:10px">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div>
+          <div style="font-size:11px;font-weight:700;color:${userRoleInfo.color};margin-bottom:4px">
+            ${userRoleInfo.emoji} あなた（${userRoleInfo.label}）
+          </div>
+          <div style="font-size:12px;line-height:1.6;color:var(--text)">
+            ${img.you ?? userRoleInfo.desc}
+          </div>
+          ${img.tip ? `<div style="margin-top:6px;padding:5px 8px;
+            background:var(--amber-light);border-radius:6px;
+            font-size:11px;color:var(--text)">💡 ${img.tip}</div>` : ''}
+        </div>
+        <div>
+          ${partnerRoleInfo ? `
+          <div style="font-size:11px;font-weight:700;color:${partnerRoleInfo.color};margin-bottom:4px">
+            ${partnerRoleInfo.emoji} パートナー（${partnerRoleInfo.label}）
+          </div>
+          <div style="font-size:12px;line-height:1.6;color:var(--text)">
+            ${img.partner ?? partnerRoleInfo.desc}
+          </div>` : ''}
+        </div>
+      </div>
+      <div style="margin-top:10px">
+        <div style="font-size:10px;color:var(--text2);margin-bottom:4px">音域の棲み分けイメージ</div>
+        ${_ssRenderRangeDiagram(ssUserRole, partnerRole)}
+      </div>
+    </div>` : '';
+
+  const warnHTML = warnings.length > 0 ? `
+    <div style="margin-top:8px;padding:8px 12px;background:var(--amber-light);
+                border:1px solid var(--amber);border-radius:8px;
+                font-size:11px;color:var(--text)">
+      ${warnings.map(w => `⚠️ ${w}`).join('<br>')}
+    </div>` : '';
+
+  return `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">
+    ${roleBtns}
+  </div>${detailCard}${warnHTML}`;
+}
+
+/**
+ * inline役割パネルのみ差分更新（_ssRenderSetupPanel全再描画を避ける）
+ */
+function _ssUpdateRolePanelInline() {
+  const el = document.getElementById('ss-role-panel-inline');
+  if (!el) return;
+  el.innerHTML = _ssBuildRolePanelHTML();
+}
+
+/**
+ * inline版役割選択ハンドラ（バグ2修正: 相互再帰を排除）
+ * _ssUpdateRolePanel は呼ばず、inline版のみ更新する。
+ * ssPartnerRole の確定は _ssBuildRolePanelHTML 内で行われるため二重呼び出し不要。
+ */
+function ssSetUserRoleInline(v) {
+  ssUserRole = v;
+  _ssUpdateRolePanelInline();
+}
+
+// ---------------------------------------------------------------
+// 役割パネル（後方互換スタブ）
+// 実体は _ssBuildRolePanelHTML / _ssUpdateRolePanelInline に移行済み。
+// session_engine.txt 等から呼ばれる可能性があるため関数は残す。
+// ---------------------------------------------------------------
+
+function _ssUpdateRolePanel() {
+  // ss-role-panel（旧独立セクション）が残っていれば更新
+  const wrap = document.getElementById('ss-role-panel');
+  if (wrap) {
+    const { partnerRole } = resolveRoleMutex(
+      ssUserRole, ssUserInstrument, ssPartnerInstrument
+    );
+    ssPartnerRole = partnerRole;
+    wrap.innerHTML = _ssBuildRolePanelHTML();
+  }
+  // inline版（ss-setup 内）も更新
+  _ssUpdateRolePanelInline();
+}
+
+/**
+ * ユーザーとパートナーの音域棲み分けを横長バーで可視化
+ * @private
+ */
+function _ssRenderRangeDiagram(userRoleKey, partnerRoleKey) {
+  const MIDI_MIN = 48, MIDI_MAX = 84, RANGE = MIDI_MAX - MIDI_MIN;
+  const userRole    = SESSION_ROLES[userRoleKey];
+  const partnerRole = SESSION_ROLES[partnerRoleKey];
+  if (!userRole || !partnerRole) return '';
+
+  const pct = (midi) => ((midi - MIDI_MIN) / RANGE * 100).toFixed(1);
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // 音域バーを生成
+  const makeBar = (role, color, label) => {
+    const lo = clamp(role.midiRange[0], MIDI_MIN, MIDI_MAX);
+    const hi = clamp(role.midiRange[1], MIDI_MIN, MIDI_MAX);
+    const left  = pct(lo);
+    const width = pct(hi) - pct(lo);
+    return `
+      <div style="position:relative;height:18px;margin-bottom:4px">
+        <div style="position:absolute;left:${left}%;width:${width}%;height:100%;
+                    background:${color};opacity:0.5;border-radius:4px"></div>
+        <div style="position:absolute;left:${left}%;font-size:9px;
+                    color:${color};top:2px;padding-left:4px;font-weight:700">${label}</div>
+      </div>`;
+  };
+
+  const labels = ['C3','','','','C4','','','','C5','','','','C6'].map((l, i) =>
+    l ? `<span style="position:absolute;left:${(i/12*100).toFixed(1)}%;font-size:8px;
+                color:var(--text3);transform:translateX(-50%)">${l}</span>` : ''
+  ).join('');
+
+  return `
+    <div style="position:relative;background:var(--bg3);border-radius:6px;
+                padding:6px 6px 14px;overflow:hidden">
+      ${makeBar(userRole,    userRole.color,    `あなた: ${userRole.label}`)}
+      ${makeBar(partnerRole, partnerRole.color, `パートナー: ${partnerRole.label}`)}
+      <div style="position:relative;height:12px;border-top:1px solid var(--border);
+                  margin-top:2px">${labels}</div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------
+// 帯域ビジュアライザ（SVG描画）
+// ---------------------------------------------------------------
+
+/**
+ * メイン描画関数
+ * @param {Array|null} freqBands  buildFreqBands() の出力（nullなら空表示）
+ * @param {number}     currentMi  現在の小節インデックス
+ */
+function _ssRenderFreqViz(freqBands, currentMi) {
+  const svg = document.getElementById('ss-freq-viz');
+  if (!svg) return;
+
+  const W       = 680;
+  const H       = 200;
+  const MIDI_MIN= FREQ_VIZ.MIDI_MIN;  // 36
+  const MIDI_MAX= FREQ_VIZ.MIDI_MAX;  // 96
+  const RANGE   = MIDI_MAX - MIDI_MIN; // 60半音
+  const GRID    = FREQ_VIZ.BEAT_GRID;
+  const ML      = 32;   // 左マージン（音名ラベル）
+  const MR      = 8;
+  const MT      = 12;
+  const MB      = 20;
+  const innerW  = W - ML - MR;
+  const innerH  = H - MT - MB;
+  const beatW   = innerW / (freqBands?.[currentMi]?.length ?? GRID.length);
+
+  const userProf = INSTRUMENT_PROFILES[ssUserInstrument];
+
+  // MIDI → Y座標（高音が上）
+  const midiToY = (midi) =>
+    MT + innerH - ((midi - MIDI_MIN) / RANGE) * innerH;
+
+  let h = '';
+
+  // 背景
+  h += `<rect x="0" y="0" width="${W}" height="${H}" fill="var(--bg2)" rx="6"/>`;
+
+  // 音名ラベル（C2, C3, C4, C5, C6, C7）
+  [36, 48, 60, 72, 84, 96].forEach(midi => {
+    const y    = midiToY(midi);
+    const name = ['C2','C3','C4','C5','C6','C7'][(midi - 36) / 12];
+    h += `<line x1="${ML}" y1="${y}" x2="${W - MR}" y2="${y}"
+                stroke="var(--border)" stroke-width="0.8" stroke-dasharray="3,3"/>`;
+    h += `<text x="${ML - 4}" y="${y + 4}" text-anchor="end"
+                font-size="9" fill="var(--text3)">${name}</text>`;
+  });
+
+  // ユーザー楽器の音域帯（薄い背景色）
+  if (userProf) {
+    const yTop = midiToY(userProf.range.max);
+    const yBot = midiToY(userProf.range.min);
+    h += `<rect x="${ML}" y="${yTop}" width="${innerW}" height="${yBot - yTop}"
+                fill="var(--blue)" opacity="0.06" rx="2"/>`;
+    h += `<text x="${ML + 4}" y="${yTop + 12}" font-size="9" fill="var(--blue)" opacity="0.6">
+            ${userProf.label} 音域
+          </text>`;
+  }
+
+  // U3: 引き算の見える化 — complexity に応じてパートナー占有帯域の濃さを変える
+  // simple=0.2: 濃い（フル）、standard=0.5: 中、dense=0.8: 薄い（間引き済み）
+  const complexityVal = COMPLEXITY_PRESETS[ssComplexity]?.value ?? 0.5;
+  const partnerOpacity = Math.max(0.2, 0.65 - complexityVal * 0.5).toFixed(2);
+
+  // 現在小節の帯域データを描画
+  const bands = freqBands?.[currentMi] ?? [];
+  bands.forEach((band, bi) => {
+    const x = ML + bi * beatW;
+
+    if (band.occupiedRange) {
+      // パートナー占有帯域（U3: complexity で透明度変化）
+      const yTop = midiToY(band.occupiedRange.max);
+      const yBot = midiToY(band.occupiedRange.min);
+      h += `<rect x="${x + 1}" y="${yTop}" width="${beatW - 2}" height="${Math.max(yBot - yTop, 2)}"
+                  fill="var(--orange)" opacity="${partnerOpacity}" rx="2"/>`;
+
+      // 空き帯域（ユーザー音域内）を緑でハイライト
+      if (userProf) {
+        const freeRanges = _calcFreeRanges(band, userProf.range);
+        freeRanges.forEach(fr => {
+          const fyTop = midiToY(fr.max);
+          const fyBot = midiToY(fr.min);
+          // 空き帯域が広いほど強調（U3: 引き算の効果が一目でわかる）
+          const freeHeight = fyBot - fyTop;
+          const freeOpacity = Math.min(0.15 + freeHeight / innerH * 0.5, 0.55).toFixed(2);
+          h += `<rect x="${x + 1}" y="${fyTop}" width="${beatW - 2}" height="${Math.max(freeHeight, 2)}"
+                      fill="var(--green)" opacity="${freeOpacity}" rx="1"/>`;
+        });
+      }
+    }
+
+    // beat ラベル
+    if ([1, 2, 3, 4].includes(band.beat)) {
+      h += `<text x="${x + beatW / 2}" y="${H - 4}" text-anchor="middle"
+                  font-size="9" fill="var(--text3)">${band.beat}</text>`;
+    }
+  });
+
+  // 再生位置カーソル
+  if (bands.length > 0) {
+    const ratio = (SessionPlayer.currentMeasure === currentMi)
+      ? _ssCalcBeatProgress() : -1;
+    if (ratio >= 0) {
+      const cx = ML + ratio * innerW;
+      h += `<line x1="${cx}" y1="${MT}" x2="${cx}" y2="${H - MB}"
+                  stroke="var(--blue)" stroke-width="1.5" opacity="0.8"/>`;
+    }
+  }
+
+  // 空の場合のプレースホルダ
+  if (bands.length === 0) {
+    h += `<text x="${W / 2}" y="${H / 2}" text-anchor="middle"
+                dominant-baseline="middle" font-size="12" fill="var(--text3)">
+            「セッション開始」を押すと帯域が表示されます
+          </text>`;
+  }
+
+  svg.innerHTML = h;
+}
+
+/**
+ * ユーザー音域内の空き帯域リストを計算
+ * @private
+ */
+function _calcFreeRanges(band, userRange) {
+  const occupied = new Set(band.occupied ?? []);
+  const free     = [];
+  let   start    = null;
+
+  for (let m = userRange.min; m <= userRange.max; m++) {
+    if (!occupied.has(m)) {
+      if (start === null) start = m;
+    } else {
+      if (start !== null) {
+        free.push({ min: start, max: m - 1 });
+        start = null;
+      }
+    }
+  }
+  if (start !== null) free.push({ min: start, max: userRange.max });
+  return free;
+}
+
+/**
+ * 現在の拍の進捗(0〜1)を返す（カーソル表示用）  [Fix-Cursor]
+ *
+ * ▼ v2 → v3 変更点 [B6]
+ *   旧実装は `!SessionPlayer.isPlaying` で -1 を返していたため、
+ *   一時停止中はカーソルが消えていた。
+ *   v3 では isPaused 中も pauseAudioOffset から進捗を計算して返す。
+ * @private
+ */
+function _ssCalcBeatProgress() {
+  const ctx  = SessionPlayer.ctx;
+  const mi   = SessionPlayer.currentMeasure ?? 0;
+  const starts = SessionPlayer.measureStartTimes;
+
+  if (!starts || starts.length === 0 || mi < 0) return -1;
+
+  let elapsed;
+  if (SessionPlayer.isPlaying && ctx) {
+    // 再生中: AudioContext 実時間から算出
+    elapsed = ctx.currentTime - SessionPlayer.startAudioTime + SessionPlayer.pauseAudioOffset;
+  } else if (SessionPlayer.isPaused || SessionPlayer.pauseAudioOffset > 0) {
+    // 一時停止中 / シーク後: 記憶している offset をそのまま使う
+    elapsed = SessionPlayer.pauseAudioOffset;
+  } else {
+    return -1;
+  }
+
+  const miStart  = starts[mi] ?? 0;
+  const miEnd    = starts[mi + 1] ?? SessionPlayer.totalDuration;
+  const measureLen = miEnd - miStart;
+  if (measureLen <= 0) return -1;
+
+  return Math.min(Math.max((elapsed - miStart) / measureLen, 0), 1);
+}
+
+// ---------------------------------------------------------------
+// ヒントパネル（リアルタイム）
+// ---------------------------------------------------------------
+
+// ヒントタイマー・キャッシュ
+let _ssHintTimer      = null;
+// ① ヒント文言を小節単位で固定するキャッシュ（高速点滅防止）
+let _ssHintCache      = null;   // { hint, subHint, role, playableMidi, beatIdx }
+let _ssHintCacheMi    = -1;     // キャッシュが有効な小節インデックス
+let _ssHintCacheBeat  = -1;     // キャッシュが有効な拍インデックス
+
+/**
+ * 小節変化時に呼ぶ。タイマーを更新して拍追跡を開始する。
+ */
+function _ssRenderHint(mi) {
+  const wrap = document.getElementById('ss-hint');
+  // F3修正: バトンタッチ後は SessionPlayer.score が差し替え済み
+  // ssCurrentScore より SessionPlayer.score を優先してガード判定する
+  const activeScore = SessionPlayer.score ?? ssCurrentScore;
+  if (!wrap || !activeScore?.freqBands) return;
+  // 小節が変わったらヒントキャッシュをクリア
+  _ssHintCacheMi   = -1;
+  _ssHintCacheBeat = -1;
+  _ssHintCache     = null;
+
+  if (_ssHintTimer) clearInterval(_ssHintTimer);
+  // 250ms ごとに拍位置を確認し、拍が変わったときだけヒントを更新する
+  _ssHintTimer = setInterval(() => _ssUpdateHintBeat(mi), 250);
+  _ssUpdateHintBeat(mi);
+}
+
+function _ssUpdateHintBeat(mi) {
+  const wrap = document.getElementById('ss-hint');
+  if (!wrap) return;
+
+  // E4修正: バトンタッチ後は SessionPlayer.score.freqBands が更新されている
+  // ssCurrentScore より SessionPlayer.score を優先して参照する
+  const activeScore = SessionPlayer.score ?? ssCurrentScore;
+  if (!activeScore?.freqBands) return;
+
+  const activeMi = SessionPlayer.currentMeasure >= 0
+    ? SessionPlayer.currentMeasure : ssCurrentMeasure;
+
+  const bands = activeScore.freqBands[activeMi] ?? [];
+  if (bands.length === 0) return;
+
+  const progress = _ssCalcBeatProgress();
+  const beatIdx = progress >= 0
+    ? Math.min(Math.floor(progress * bands.length), bands.length - 1)
+    : 0;
+
+  // ② 同じ拍ならキャッシュを再利用（ランダム文言を固定）
+  if (activeMi === _ssHintCacheMi && beatIdx === _ssHintCacheBeat && _ssHintCache) {
+    return;
+  }
+
+  // 拍が変わった → ヒントを再生成してキャッシュ
+  const band = bands[beatIdx] ?? bands[0];  // E4: activeScore から取得済みの bands を使う
+  _ssHintCache     = generateSpaceHint(band, ssUserInstrument);
+  _ssHintCacheMi   = activeMi;
+  _ssHintCacheBeat = beatIdx;
+
+  _ssDrawHint(_ssHintCache);
+}
+
+/**
+ * ヒントパネルを描画する（超短縮テキスト版）
+ *
+ * 小節切り替わりに0.3sフェードでテキストを差し替える。
+ * 情報は「絵文字＋短い一言」のみ。subHint/フレットガイド/引き算率は廃止。
+ *
+ * @param {{ hint, subHint, role, playableMidi }} hintData
+ */
+function _ssDrawHint(hintData) {
+  const wrap = document.getElementById('ss-hint');
+  if (!wrap || !hintData) return;
+
+  const { role } = hintData;
+  const roleInfo = role ? SESSION_ROLES[role] : null;
+  const isRest   = (role === null);
+
+  const shortHint = _ssMakeShortHint(hintData);
+
+  const bg     = isRest ? 'var(--orange-light)' : 'var(--green-light)';
+  const border = isRest ? 'var(--orange)'        : 'var(--green)';
+  const color  = isRest ? 'var(--orange)'        : (roleInfo?.color ?? 'var(--green)');
+
+  // フェード中に次の拍が来ても競合しないようフラグ管理
+  if (wrap._fadePending) {
+    // フェード待機中は既存タイマーをキャンセルして即差し替え
+    clearTimeout(wrap._fadeTimer);
+    wrap._fadePending = false;
+    wrap.innerHTML = _ssHintHTML(shortHint, bg, border, color);
+    requestAnimationFrame(() => {
+      const inner = wrap.querySelector('.ss-hint-inner');
+      if (inner) inner.style.opacity = '1';
+    });
+    return;
+  }
+
+  const inner = wrap.querySelector('.ss-hint-inner');
+  if (inner) {
+    // 既存要素あり: フェードアウト → 差し替え → フェードイン
+    inner.style.opacity = '0';
+    wrap._fadePending = true;
+    wrap._fadeTimer = setTimeout(() => {
+      wrap._fadePending = false;
+      wrap.innerHTML = _ssHintHTML(shortHint, bg, border, color);
+      requestAnimationFrame(() => {
+        const newInner = wrap.querySelector('.ss-hint-inner');
+        if (newInner) newInner.style.opacity = '1';
+      });
+    }, 150);
+  } else {
+    // 初回: 直接描画してすぐフェードイン
+    wrap.innerHTML = _ssHintHTML(shortHint, bg, border, color);
+    requestAnimationFrame(() => {
+      const newInner = wrap.querySelector('.ss-hint-inner');
+      if (newInner) newInner.style.opacity = '1';
+    });
+  }
+}
+
+function _ssHintHTML(shortHint, bg, border, color) {
+  return `<div class="ss-hint-inner"
+    style="border-radius:10px;border:1px solid ${border};
+           padding:8px 14px;background:${bg};
+           opacity:0;transition:opacity 0.3s ease;
+           display:flex;align-items:center;gap:10px">
+    <div style="font-size:15px;font-weight:700;color:${color};
+                letter-spacing:0.02em;line-height:1.4">
+      ${shortHint}
+    </div>
+  </div>`;
+}
+
+/**
+ * hintData から絵文字＋短い一言を生成する
+ * 元の hint 文言を短縮形にマッピング。
+ */
+function _ssMakeShortHint(hintData) {
+  const { hint, role } = hintData;
+  if (role === null) {
+    // 休符系
+    if (hint.includes('引く番') || hint.includes('待') || hint.includes('引き'))
+      return '🤫 待て';
+    if (hint.includes('聴き'))
+      return '👂 聴こう';
+    if (hint.includes('隙間'))
+      return '⏳ 隙間を待つ';
+    return '🤫 今は休む';
+  }
+  if (role === 'MELODY_HIGH') {
+    if (hint.includes('高音') || hint.includes('A弦'))
+      return '🎵 高音域へ';
+    if (hint.includes('フレーズ') || hint.includes('旋律'))
+      return '🎵 メロディ！';
+    return '🎵 高音空き';
+  }
+  if (role === 'MELODY_MID') {
+    if (hint.includes('中') || hint.includes('E') || hint.includes('C弦'))
+      return '🎶 中音域へ';
+    return '🎶 対旋律';
+  }
+  if (role === 'OBBLIGATO') {
+    if (hint.includes('高音') || hint.includes('A弦') || hint.includes('上'))
+      return '✨ 高音空き！';
+    if (hint.includes('フレーズ'))
+      return '✨ 短いフレーズ！';
+    return '✨ 狭い隙間';
+  }
+  if (role === 'CHORD_COMP') {
+    if (hint.includes('中') || hint.includes('E/C'))
+      return '🎸 中域コンプ';
+    return '🎸 コードトーン';
+  }
+  if (role === 'BASS') {
+    return '🔉 ルート音へ';
+  }
+  if (role === 'RHYTHM') {
+    return '🥁 リズムを刻む';
+  }
+  return '💭 スペースあり';
+}
+
+// ---------------------------------------------------------------
+// バトンタッチ予告バナー
+// ---------------------------------------------------------------
+
+function _ssRenderBatonBanner(currentRole, nextRole) {
+  const wrap = document.getElementById('ss-baton-banner');
+  if (!wrap) return;
+
+  const curr = SESSION_ROLES[currentRole];
+  if (!curr) { wrap.innerHTML = ''; return; }
+
+  // 次役割が同じ＝バトンタッチ直後で継続中
+  const isSameRole = (currentRole === nextRole);
+  const next = isSameRole ? null : SESSION_ROLES[nextRole];
+
+  wrap.innerHTML = `
+    <div style="text-align:center;padding:10px;border-radius:10px;
+                background:var(--amber-light);border:2px solid var(--amber);
+                animation:ss-blink 0.8s ease-in-out 3">
+      <div style="font-size:12px;color:var(--amber);font-weight:700">
+        ${isSameRole ? 'バトンタッチ！ あなたの担当が変わりました' : '次の小節から役割が変わります'}
+      </div>
+      <div style="font-size:15px;margin-top:4px">
+        ${isSameRole
+          ? `${curr.emoji} ${curr.label} を担当してください`
+          : `${curr.emoji} ${curr.label} → ${next?.emoji ?? ''} ${next?.label ?? ''}`}
+      </div>
+    </div>`;
+
+  setTimeout(() => { if (wrap) wrap.innerHTML = ''; }, 3000);
+}
+
+// ---------------------------------------------------------------
+// 再生コントロールUI  [Add-Tempo] [Add-Seek]
+// ---------------------------------------------------------------
+
+/**
+ * プレイヤーバーを完全再構築する（セッション開始時・停止時のみ呼ぶ）
+ * [C5] 毎小節の onMeasureChange から呼ぶと innerHTML 再構築でスライダーが
+ *      リセットされる問題を防ぐため、小節更新時は _ssSoftUpdatePlayerBar() を使う。
+ */
+function _ssRenderPlayerBar() {
+  const wrap = document.getElementById('ss-player-bar');
+  if (!wrap) return;
+
+  const isPlaying = SessionPlayer.isPlaying;
+  const curMi     = (SessionPlayer.currentMeasure ?? -1) + 1;
+  const totalMi   = ssCurrentScore?.measures?.length ?? 0;
+  const tempo     = SessionPlayer.tempo ?? ssTempo;
+  const hasScore  = !!ssCurrentScore;
+
+  wrap.innerHTML = `
+    <div id="ss-player-inner"
+         style="background:var(--surface);border-radius:12px;
+                border:1px solid var(--border);padding:10px 14px">
+
+      <!-- 1行目: 再生ボタン群 + 小節表示 -->
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+
+        <button class="ss-ctrl-btn" title="先頭へ"
+                onclick="sessionPlayerSeek(0);_ssRenderPlayerBar()"
+                ${!hasScore ? 'disabled style="opacity:0.4"' : ''}>⏮</button>
+
+        <button class="ss-ctrl-btn" title="前の小節"
+                onclick="sessionPlayerSeekToMeasure(-1);_ssSoftUpdatePlayerBar()"
+                ${!hasScore ? 'disabled style="opacity:0.4"' : ''}>◀</button>
+
+        <button id="ss-play-btn" class="ss-ctrl-btn"
+                title="${isPlaying ? '一時停止' : '再生'}"
+                onclick="ssTogglePlay()"
+                style="background:var(--green);color:#fff;border-color:var(--green)">
+          ${isPlaying ? '⏸' : '▶'}
+        </button>
+
+        <button class="ss-ctrl-btn" title="停止"
+                onclick="sessionPlayerStop();_ssRenderPlayerBar()">⏹</button>
+
+        <button class="ss-ctrl-btn" title="次の小節"
+                onclick="sessionPlayerSeekToMeasure(1);_ssSoftUpdatePlayerBar()"
+                ${!hasScore ? 'disabled style="opacity:0.4"' : ''}>▶▶</button>
+
+        <div id="ss-measure-label"
+             style="font-size:12px;color:var(--text2);min-width:60px">
+          小節 ${hasScore ? `${curMi} / ${totalMi}` : '- / -'}
+        </div>
+
+        <div style="flex:1"></div>
+
+        <!-- 声部ミュート -->
+        <div style="display:flex;gap:6px">
+          ${[
+            { v:'melody', label:'メロディ',   icon:'🎵' },
+            { v:'bass',   label:'ベース',     icon:'🔉' },
+            { v:'inner',  label:'コンピング', icon:'🎸' },
+          ].map(({ v, label, icon }) =>
+            `<button class="ss-mute-btn ${SessionPlayer.mute[v] ? 'muted' : ''}"
+                     onclick="ssToggleMute('${v}')"
+                     title="${label}ミュート">${icon}</button>`
+          ).join('')}
+        </div>
+      </div>
+
+      <!-- 2行目: テンポスライダー -->
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:11px;color:var(--text2);white-space:nowrap">🎚 テンポ</span>
+        <input type="range" id="ss-tempo-slider"
+               min="40" max="240" step="1" value="${tempo}"
+               style="flex:1;accent-color:var(--green)"
+               oninput="ssOnTempoInput(this.value)"
+               onchange="ssOnTempoCommit(this.value)">
+        <span id="ss-tempo-label"
+              style="font-size:12px;font-weight:700;min-width:44px;
+                     text-align:right;color:var(--text)">
+          ${tempo} <span style="font-size:10px;color:var(--text2)">BPM</span>
+        </span>
+      </div>
+    </div>`;
+}
+
+/**
+ * 小節変更時の軽量更新（再生ボタン・小節ラベルのみ差分更新）  [C5]
+ * innerHTML を触らないため、テンポスライダー操作中でも安全。
+ */
+function _ssSoftUpdatePlayerBar() {
+  const playBtn = document.getElementById('ss-play-btn');
+  const label   = document.getElementById('ss-measure-label');
+  const isPlaying = SessionPlayer.isPlaying;
+  const curMi     = (SessionPlayer.currentMeasure ?? -1) + 1;
+  const totalMi   = ssCurrentScore?.measures?.length ?? 0;
+
+  if (playBtn) {
+    playBtn.textContent = isPlaying ? '⏸' : '▶';
+    playBtn.title       = isPlaying ? '一時停止' : '再生';
+  }
+  if (label) {
+    label.textContent = `小節 ${curMi > 0 ? `${curMi} / ${totalMi}` : '- / -'}`;
+  }
+}
+
+// ---------------------------------------------------------------
+// セッション開始  [Fix-Midi]
+// ---------------------------------------------------------------
+
+function ssStart() {
+  // コード進行のバリデーション（MIDIインポート時は不要）
+  if (!ssImportedMidi && (!ssChords || ssChords.length === 0)) {
+    alert('コード進行を入力してください');
+    return;
+  }
+
+  // ヒントキャッシュをリセット
+  _ssHintCache     = null;
+  _ssHintCacheMi   = -1;
+  _ssHintCacheBeat = -1;
+  if (_ssHintTimer) { clearInterval(_ssHintTimer); _ssHintTimer = null; }
+
+  // E1修正: モード別のデフォルト役割を適用してから _ssUpdateRolePanel を呼ぶ。
+  // _ssUpdateRolePanel 内の resolveRoleMutex が ssPartnerRole を上書きするため、
+  // defaultPartnerRole は resolveRoleMutex の結果で決まる場合のみ有効。
+  // find_space は defaultUserRole=OBBLIGATO のみで partnerRole は resolveRoleMutex に委ねる。
+  const modeConf = SESSION_MODES[ssMode];
+  if (modeConf?.defaultUserRole) {
+    ssUserRole = modeConf.defaultUserRole;
+  }
+  // _ssUpdateRolePanel を呼んで resolveRoleMutex で ssPartnerRole を確定させる
+  _ssUpdateRolePanel();
+  // resolveRoleMutex 後に defaultPartnerRole があれば上書き（明示指定を優先）
+  if (modeConf?.defaultPartnerRole) {
+    ssPartnerRole = modeConf.defaultPartnerRole;
+  }
+
+  const complexity = COMPLEXITY_PRESETS[ssComplexity]?.value ?? 0.5;
+
+  // パートナースコア生成  [Fix-Midi]
+  // ▼ v1 からの変更点
+  //   旧実装は `ssPartnerInstrument === 'piano'` の場合だけ MIDI を使い、
+  //   ウクレレ同士の場合は ssChords から生成するスコアを使っていた。
+  //   v2 では楽器を問わず、MIDIがあれば優先して
+  //   importFromMidi → buildSoloScoreFromImport パイプラインを使う。
+  //   テンポも score.tempo から自動取得して ssTempo / SessionPlayer.tempo に反映する。
+  let score;
+  if (ssImportedMidi) {
+    // MIDI → ウクレレ最適化パイプライン
+    let importedScore;
+    try {
+      const rawMidi = importFromMidi(ssImportedMidi);
+      // rawMidi.key が自動推定された場合も ssKey を上書きして表示に反映
+      if (rawMidi.key && rawMidi.key !== ssKey) {
+        ssKey = rawMidi.key;
+        // E7修正: ssStart 実行中のパネル再構築は役割をリセットするため行わない
+        // キーの表示更新はセッション終了後のパネル再描画で反映される
+      }
+      // [B2] playMode / complexity / key を正しく渡す
+      // ピアノ選択肢廃止に伴い playMode は常に 'ukulele' を使用
+      const playMode = 'ukulele';
+      importedScore = buildSoloScoreFromImport(rawMidi, {
+        key:          rawMidi.key ?? ssKey,
+        playMode,
+        complexity,
+        arrangeStyle: 'standard',
+      });
+    } catch (err) {
+      console.error('MIDIスコア変換エラー:', err);
+      alert(`MIDIの変換に失敗しました: ${err.message ?? err}`);
+      return;
+    }
+    score = importedScore;
+
+    // MIDIのテンポを自動反映
+    if (score.tempo && score.tempo !== ssTempo) {
+      ssTempo = score.tempo;
+    }
+
+    // [Fix-Midi] MIDIインポートスコアにも役割フィルタ・帯域データを適用する。
+    // buildSoloScoreFromImport はソロ練習用スコアを返すため、
+    // セッション用の声部フィルタ（userRole に応じた voice 削除）と
+    // 楽器制約（High-G ならベース削除）が適用されていない。
+    // buildPartnerScore と同じロジックを後付けで適用する。
+    const partnerProf = INSTRUMENT_PROFILES[ssPartnerInstrument];
+    const voiceToRemove = SESSION_ROLES[ssUserRole]?.voice ?? null;
+
+    score.measures = score.measures.map(m => {
+      let events = m.events ?? [];
+      // ユーザーが担う voice を削除
+      if (voiceToRemove) {
+        events = events.filter(ev => ev.voice !== voiceToRemove);
+      }
+      // パートナー楽器がベースを担えない場合は削除
+      if (partnerProf && !partnerProf.roleCapable.BASS) {
+        events = events.filter(ev => ev.voice !== 'bass');
+      }
+      return { ...m, events };
+    });
+    // [C6] MIDIインポートスコアの m.chord が null のままだと
+    //      drawSoloTab がコード名を "null" と表示する。
+    //      buildSoloScoreFromImport 後に chord=null の小節を ssKey で補完する。
+    score.measures = score.measures.map(m => ({
+      ...m,
+      chord: m.chord ?? ssKey,
+    }));
+
+    // 帯域データを生成（ビジュアライザ用）
+    score.freqBands      = buildFreqBands(score.measures);
+    score.partnerRole    = ssPartnerRole;
+    score.userRole       = ssUserRole;
+    score.partnerInstrument = ssPartnerInstrument;
+    score._isSessionScore   = true;
+    score._complexity       = complexity;  // E3: バトンタッチ時の reapplyBatonRoles 用
+  } else {
+    score = buildPartnerScore({
+      chords:            ssChords,
+      key:               ssKey,
+      genre:             ssGenre,
+      partnerInstrument: ssPartnerInstrument,
+      partnerRole:       ssPartnerRole,
+      userRole:          ssUserRole,
+      complexity,
+      arrangeStyle:      'standard',
+    });
+  }
+
+  ssCurrentScore = score;
+  ssCurrentScore._complexity = complexity;  // E3: バトンタッチ用に記録
+  // テンポを確定（score.tempo が設定されていればそちらを優先）
+  ssTempo = score.tempo ?? ssTempo;
+
+  // ── タブ譜を初期描画（パートナースコア） ──
+  _ssDrawPartnerTab(score, 0);
+
+  // バトンタッチモードのスケジュール生成
+  const batonSchedule = (ssMode === 'baton_touch')
+    ? buildBatonSchedule(
+        score.measures.length,
+        ssBatonEvery,
+        ssUserRole,
+        ssPartnerRole,
+        ssUserInstrument,    // ハードコード修正: 楽器を正しく渡す
+        ssPartnerInstrument
+      )
+    : null;
+
+  // 帯域ビジュアライザを初期描画
+  _ssRenderFreqViz(score.freqBands, 0);
+
+  // 再生開始
+  sessionPlayerPlay(score, {
+    tempo:         ssTempo,
+    loop:          true,
+    batonSchedule,
+    userRole:      ssUserRole,
+
+    onMeasureChange: (mi, role) => {
+      ssCurrentMeasure = mi;
+      // SessionPlayer.score を参照することでバトンタッチ後の新スコアを使う
+      // (クロージャ変数 score は初期スコアのままなので使わない)
+      const latestScore = SessionPlayer.score ?? ssCurrentScore;
+      _ssRenderFreqViz(latestScore.freqBands, mi);
+      _ssRenderHint(mi);
+      _ssDrawPartnerTab(latestScore, mi);
+      _ssSoftUpdatePlayerBar();
+    },
+
+    onBatonSwitch: (current, next) => {
+      _ssRenderBatonBanner(current, next);
+      ssUpdateStatusBar(true);
+    },
+
+    onComplete: () => {
+      if (_ssHintTimer) { clearInterval(_ssHintTimer); _ssHintTimer = null; }
+      ssUpdateStatusBar(false);
+      _ssRenderPlayerBar();
+    },
+  });
+
+  ssUpdateStatusBar(true);
+  _ssRenderPlayerBar();
+}
+
+// ---------------------------------------------------------------
+// テンポ操作  [Add-Tempo]
+// ---------------------------------------------------------------
+
+/**
+ * スライダーの input イベント — ラベルをリアルタイム更新（再生には反映しない）
+ */
+function ssOnTempoInput(val) {
+  const bpm = parseInt(val, 10);
+  ssTempo   = bpm;
+  const label = document.getElementById('ss-tempo-label');
+  if (label) label.innerHTML = `${bpm} <span style="font-size:10px;color:var(--text2)">BPM</span>`;
+}
+
+/**
+ * スライダーの change イベント — 再生エンジンに反映
+ * ドラッグ確定時のみ呼ばれるため AudioContext の再構築が1回で済む
+ */
+function ssOnTempoCommit(val) {
+  const bpm = parseInt(val, 10);
+  ssTempo   = bpm;
+  sessionPlayerSetTempo(bpm);
+}
+
+/**
+ * session_player.txt の sessionPlayerSetTempo から呼ばれるコールバック  [Add-Tempo]
+ * スライダーとラベルの表示を同期する
+ */
+function sessionUIUpdateTempo(bpm) {
+  ssTempo = bpm;
+  const slider = document.getElementById('ss-tempo-slider');
+  const label  = document.getElementById('ss-tempo-label');
+  if (slider) slider.value = bpm;
+  if (label)  label.innerHTML = `${bpm} <span style="font-size:10px;color:var(--text2)">BPM</span>`;
+}
+
+// ---------------------------------------------------------------
+// イベントハンドラ群
+// ---------------------------------------------------------------
+
+function ssSetUserInstrument(v) {
+  ssUserInstrument = v;
+  // High-G選択時にBASS役割が選ばれていたら自動解除
+  const prof = INSTRUMENT_PROFILES[v];
+  if (prof && prof.roleCapable[ssUserRole] === false) {
+    ssUserRole = 'MELODY_HIGH';
+  }
+  _ssRenderSetupPanel();  // 内部で役割パネルも再描画される
+}
+
+function ssSetPartnerInstrument(v) {
+  ssPartnerInstrument = v;
+  _ssRenderSetupPanel();  // 内部で役割パネルも再描画される
+}
+
+function ssSetUserRole(v) {
+  ssUserRole = v;
+  _ssUpdateRolePanel();
+}
+
+function ssResetScore() {
+  // 引き算率は廃止のため何もしない（後方互換のため関数は残す）
+}
+
+/**
+ * セッション中ステータスバーを更新する（ssStart / バトンタッチ時に呼ぶ）
+ */
+function ssUpdateStatusBar(show) {
+  const bar = document.getElementById('ss-status-bar');
+  if (!bar) return;
+  if (!show) { bar.style.display = 'none'; return; }
+
+  bar.style.display = 'block';
+  const roleInfo    = SESSION_ROLES[SessionPlayer.batonUserRole ?? ssUserRole];
+  const modeInfo    = SESSION_MODES[ssMode];
+  const roleEl      = document.getElementById('ss-status-role');
+  const modeEl      = document.getElementById('ss-status-mode');
+  if (roleEl && roleInfo) {
+    roleEl.innerHTML =
+      `<span style="font-weight:700;color:${roleInfo.color}">
+         ${roleInfo.emoji} ${roleInfo.label}
+       </span>
+       <span style="font-size:10px;color:var(--text2);margin-left:4px">を担当中</span>`;
+  }
+  if (modeEl && modeInfo) {
+    modeEl.textContent = `${modeInfo.emoji} ${modeInfo.label}`;
+  }
+}
+
+function ssSetGenre(v) {
+  ssGenre = v;
+  // ジャンルのデフォルトテンポを自動反映
+  const preset = GENRE_PRESETS[v];
+  if (preset?.tempo) {
+    ssTempo = preset.tempo;
+    if (typeof sessionUIUpdateTempo === 'function') sessionUIUpdateTempo(ssTempo);
+  }
+  _ssRenderSetupPanel();
+}
+
+/**
+ * プリセット進行を選択してコード進行に適用する
+ * @param {string} chordsStr  カンマ区切りのコード名列（例: 'C,G,Am,F'）
+ */
+function ssApplyProgression(chordsStr) {
+  ssChords = chordsStr.split(',').filter(Boolean);
+  _ssRenderSetupPanel();
+}
+
+/**
+ * 現在のコード進行をジャンル推奨コード数に拡張する
+ * js_data_genre_patch の expandProgressionForGenre を使用
+ */
+function ssExpandChords() {
+  // expandProgressionForGenre（js_data_genre_patch）があれば使う
+  if (typeof expandProgressionForGenre === 'function') {
+    ssChords = expandProgressionForGenre(ssChords, ssKey, ssGenre);
+    _ssRenderSetupPanel();
+    return;
+  }
+  // D5フォールバック: 単純繰り返しで推奨コード数まで拡張
+  const guide  = GENRE_PRESETS[ssGenre];
+  const target = guide?.recommendedChords ?? Math.max(ssChords.length * 2, 8);
+  if (ssChords.length === 0) return;
+  const result = [];
+  while (result.length < target) result.push(...ssChords);
+  ssChords = result.slice(0, target);
+  _ssRenderSetupPanel();
+}
+
+function ssSetKey(v) {
+  const prevKey = ssKey;
+  ssKey = v;
+  // キー変更時: 現在のコード進行が旧キーのプリセットに一致していれば
+  // 新キーの同名プリセットに自動追従する
+  if (typeof PROGRESSIONS !== 'undefined') {
+    const prevProgs = PROGRESSIONS[prevKey] ?? [];
+    const newProgs  = PROGRESSIONS[v]       ?? [];
+    const matched   = prevProgs.find(p => p.chords.join(' ') === ssChords.join(' '));
+    if (matched) {
+      const newProg = newProgs.find(p => p.name === matched.name);
+      if (newProg) ssChords = newProg.chords;
+    }
+  }
+  _ssRenderSetupPanel();
+}
+
+function ssSetComplexity(v) {
+  ssComplexity = v;
+  _ssRenderSetupPanel();
+}
+
+function ssSetMode(v) {
+  ssMode = v;
+  _ssRenderSetupPanel();
+}
+
+// D3修正: 手動入力でもプリセット選択ハイライトを更新する
+// デバウンスして入力中の過剰な再描画を防ぐ
+let _ssSetChordsTimer = null;
+function ssSetChords(str) {
+  ssChords = str.trim().split(/\s+/).filter(Boolean);
+  // 500ms デバウンス後にパネル再描画（プリセット選択ハイライト・拡張ボタン更新）
+  clearTimeout(_ssSetChordsTimer);
+  _ssSetChordsTimer = setTimeout(() => _ssRenderSetupPanel(), 500);
+}
+
+function ssTogglePlay() {
+  if (SessionPlayer.isPlaying) {
+    sessionPlayerPause();
+  } else if (SessionPlayer.isPaused) {
+    // [C4] 一時停止からの再開:
+    //   batonSchedule を引き継ぎ、onMeasureChange 等も ssStart と同じ定義で再バインド。
+    //   旧実装は batonSchedule を渡さずスケジュールが消えていた。
+    sessionPlayerPlay(ssCurrentScore, {
+      tempo:         SessionPlayer.tempo ?? ssTempo,
+      loop:          true,
+      batonSchedule: SessionPlayer.batonSchedule,   // 既存スケジュールを引き継ぐ
+      userRole:      SessionPlayer.batonUserRole ?? ssUserRole,
+      onMeasureChange: (mi) => {
+        ssCurrentMeasure = mi;
+        const latestScore = SessionPlayer.score ?? ssCurrentScore;
+        _ssRenderFreqViz(latestScore.freqBands, mi);
+        _ssRenderHint(mi);
+        _ssDrawPartnerTab(latestScore, mi);
+        _ssSoftUpdatePlayerBar();
+      },
+      onBatonSwitch: (curr, next) => _ssRenderBatonBanner(curr, next),
+      onComplete:    ()           => _ssRenderPlayerBar(),
+    });
+  } else {
+    ssStart();
+  }
+  _ssRenderPlayerBar();
+}
+
+function ssToggleMute(voice) {
+  SessionPlayer.mute[voice] = !SessionPlayer.mute[voice];
+  _ssRenderPlayerBar();
+}
+
+function ssHandleMidiFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const status = document.getElementById('ss-midi-status');
+  if (status) status.textContent = '読み込み中…';
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      // parseMidi で構文検証のみ（実際の変換は ssStart 時に importFromMidi で行う）
+      parseMidi(e.target.result);
+      ssImportedMidi = e.target.result;
+      if (status) {
+        // [Fix-Midi] ピアノ限定の説明を削除。楽器不問で取り込み可能
+        status.innerHTML =
+          `✅ <strong>${_escHtml(file.name)}</strong> を読み込みました。` +
+          `「セッション開始」を押すと${INSTRUMENT_PROFILES[ssPartnerInstrument]?.label ?? 'パートナー'}用に変換されます。`;
+        status.style.color = 'var(--green)';
+      }
+    } catch (err) {
+      ssImportedMidi = null;
+      if (status) {
+        status.textContent = `⚠️ ${_escHtml(err.message ?? 'MIDIファイルを読み込めませんでした')}`;
+        status.style.color = 'var(--orange)';
+      }
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// ---------------------------------------------------------------
+// パートナータブ譜描画
+// ---------------------------------------------------------------
+
+/**
+ * パートナーのスコアを drawSoloTab で描画する
+ *
+ * buildPartnerScore / buildSessionScoreFromMidi の出力は
+ * buildSoloScore と同じ measures[] 構造を持つため、
+ * drawSoloTab にそのまま渡せる。
+ *
+ * @param {object} score     SessionScore
+ * @param {number} focusMi   ハイライトする小節インデックス（-1で無効）
+ */
+function _ssDrawPartnerTab(score, focusMi = -1) {
+  if (!score || !score.measures) return;
+  if (typeof drawSoloTab !== 'function') {
+    console.warn('drawSoloTab が未定義です。solo_js_drawing.txt を include してください。');
+    return;
+  }
+
+  // drawSoloTab が期待するスコア構造に整合させる
+  // （SessionScore は buildSoloScore と同じ構造を持つが念のため補完）
+  const drawScore = {
+    key:          score.key          ?? ssKey,
+    tempo:        score.tempo        ?? 100,
+    genre:        score.genre        ?? ssGenre,
+    difficulty:   score.difficulty   ?? 'mid',
+    arrangeStyle: score.arrangeStyle ?? 'standard',
+    measures:     score.measures,
+  };
+
+  drawSoloTab('ss-tab-svg', drawScore, focusMi);
+}
+
+// ---------------------------------------------------------------
+// UIコールバック（session_player.txtから呼ばれる）
+// ---------------------------------------------------------------
+
+function sessionUIUpdatePlayerState(state) {
+  _ssRenderPlayerBar();
+}
+</script>

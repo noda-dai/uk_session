@@ -1,0 +1,1396 @@
+<script>
+// ===================================================================
+// solo_js_engine.txt  ― ソロウクレレ タブ譜自動生成エンジン v3
+//
+// v2 → v3 の変更 (js_melodyEngine v3 対応):
+//
+//   [S1] maxFret超過時のreturn廃止
+//        → オクターブ下げ代替でフレーズの穴をなくす
+//
+//   [S2] preferredStrings を全弦に拡張
+//        旧: low/mid=[3,2], high=[3,2,0]
+//        新: 全難易度=[3,2,1,0]
+//        → G弦・C弦が使われなかった音域欠落を解消
+//
+//   [S3] resolveStringConflicts後に奏法再計算を追加
+//        → 弦変更後のhammer_on/pull_off/slide表記不整合を解消
+// ===================================================================
+
+// ---------------------------------------------------------------
+// 定数定義
+// ---------------------------------------------------------------
+
+const SOLO_OPEN_MIDI = [67, 60, 64, 69]; // [0=G, 1=C, 2=E, 3=A]
+
+const MELODY_CONSTRAINTS = {
+  low: {
+    melodyLow:        64,
+    melodyHigh:       72,
+    // [S2] G弦(0)・C弦(1)を追加: 旧=[3,2] → ソロウクレレで多用される音域を確保
+    preferredStrings: [3, 2, 1, 0],
+    maxFret:          5,
+  },
+  mid: {
+    melodyLow:        62,
+    melodyHigh:       74,
+    // [S2] G弦(0)・C弦(1)を追加: 旧=[3,2] → 全弦を使えるようにする
+    preferredStrings: [3, 2, 1, 0],
+    maxFret:          7,
+  },
+  high: {
+    melodyLow:        60,
+    melodyHigh:       79,
+    // [S2] 全弦（変更なし・元々0を含む）
+    preferredStrings: [3, 2, 1, 0],
+    maxFret:          12,
+  },
+};
+
+const SOLO_GENRE_TECHNIQUES = {
+  pop:      { bassStyle: 'picking', melodyStyle: 'picking', innerStyle: 'strum',    bassPattern: 'root_fifth' },
+  bossa:    { bassStyle: 'thumb',   melodyStyle: 'picking', innerStyle: 'arpeggio', bassPattern: 'root_fifth' },
+  jazz:     { bassStyle: 'picking', melodyStyle: 'picking', innerStyle: 'strum',    swingFeel: true, bassPattern: 'walking' },
+  ballad:   { bassStyle: 'picking', melodyStyle: 'picking', innerStyle: 'arpeggio', bassPattern: 'root_only' },
+  folk:     { bassStyle: 'picking', melodyStyle: 'picking', innerStyle: 'strum',    bassPattern: 'root_fifth' },
+  rock:     { bassStyle: 'picking', melodyStyle: 'picking', innerStyle: 'strum',    bassPattern: 'root_fifth' },
+  rnb:      { bassStyle: 'picking', melodyStyle: 'picking', innerStyle: 'strum',    bassPattern: 'approach' },
+  blues:    { bassStyle: 'picking', melodyStyle: 'picking', innerStyle: 'strum',    swingFeel: true, bassPattern: 'walking' },
+  hawaiian: { bassStyle: 'thumb',   melodyStyle: 'picking', innerStyle: 'strum',    bassPattern: 'root_fifth' },
+};
+
+// ---------------------------------------------------------------
+// ベースパターン補助: 5度音のフレットを探す
+// ---------------------------------------------------------------
+function _findFifthFret(si, rootPc, maxFret) {
+  const fifthPc = (rootPc + 7) % 12;
+  return _findFretForPc(si, fifthPc, maxFret);
+}
+
+// ---------------------------------------------------------------
+// ベースパターン補助: 次コードのルートへの半音/全音接近音
+// ---------------------------------------------------------------
+function _findApproachFret(si, nextRootPc, maxFret) {
+  // 半音下から接近（最も音楽的）
+  const approachPc = (nextRootPc - 1 + 12) % 12;
+  const f = _findFretForPc(si, approachPc, maxFret);
+  if (f !== null) return f;
+  // 半音上から接近
+  const approachPc2 = (nextRootPc + 1) % 12;
+  return _findFretForPc(si, approachPc2, maxFret);
+}
+
+// ---------------------------------------------------------------
+// ベースパターン補助: ウォーキングベース用の経過音フレット
+//   root → 5度 → 半音接近(次コード) の3音で4拍を埋める
+// ---------------------------------------------------------------
+function _buildWalkingBeats(si, struct, nextStruct, maxFret) {
+  const rootFret  = _findFretForPc(si, struct.rootPc, maxFret) ?? 0;
+  const fifthFret = _findFifthFret(si, struct.rootPc, maxFret) ?? rootFret;
+
+  // 3度音（長3度=4半音 or 短3度=3半音）を取得
+  const has = (semi) => semi in struct.intervals;
+  const thirdSemi = has(4) ? 4 : has(3) ? 3 : null;
+  const thirdFret = thirdSemi !== null
+    ? (_findFretForPc(si, (struct.rootPc + thirdSemi) % 12, maxFret) ?? fifthFret)
+    : fifthFret;
+
+  // beat:4 の接近音: 次コードのルートへの半音接近
+  // 次コードがない（最終小節）場合はルートで締める
+  const approachFret = nextStruct
+    ? (_findApproachFret(si, nextStruct.rootPc, maxFret) ?? rootFret)
+    : rootFret;
+
+  // beat:1 root → beat:2 5度 → beat:3 3度 → beat:4 接近音
+  // 各 duration=1.0 で合計4拍、次小節 beat:1 に自然につながる
+  return [
+    { beat: 1, dur: 1.0, fret: rootFret,    role: 'root'    },
+    { beat: 2, dur: 1.0, fret: fifthFret,   role: 'stable'  },
+    { beat: 3, dur: 1.0, fret: thirdFret,   role: 'stable'  },
+    { beat: 4, dur: 1.0, fret: approachFret, role: 'passing' },
+  ];
+}
+
+// ---------------------------------------------------------------
+// SoloEvent ファクトリ
+// ---------------------------------------------------------------
+
+function makeSoloEvent(props) {
+  return {
+    beat:         props.beat         ?? 1,
+    duration:     props.duration     ?? 0.5,
+    voice:        props.voice        ?? 'melody',
+    stringIdx:    props.stringIdx    ?? 3,
+    fret:         props.fret         ?? 0,
+    midi:         props.midi         ?? 69,
+    role:         props.role         ?? 'passing',
+    technique:    props.technique    ?? 'normal',   // normal/hammer_on/pull_off/slide/open/thumb
+    playStyle:    props.playStyle    ?? 'picking',  // [N1] picking/strum/arpeggio/thumb
+    isStrum:      props.isStrum      ?? false,
+    strumStrings: props.strumStrings ?? [],
+    strumDir:     props.strumDir     ?? 'down',
+    emphasis:     props.emphasis     ?? 1.0,
+    tie:          props.tie          ?? false,
+    tieOut:       props.tieOut       ?? false,  // [Lyrical] 次音へタイ接続
+    tieIn:        props.tieIn        ?? false,  // [Lyrical] 前音からタイ受け
+    sustainHint:  props.sustainHint  ?? false,  // [Lyrical] 余韻保持優先
+    isObbligato:  props.isObbligato  ?? false,  // [FA-3] オブリガード識別フラグ
+    _measureIdx:  props._measureIdx  ?? 0,
+  };
+}
+
+// ---------------------------------------------------------------
+// Phase S1: buildMelodyTrack
+// [B2修正] _measureIdx を正確に付与する
+// ---------------------------------------------------------------
+
+function buildMelodyTrack(chordNames, key, options = {}) {
+  const { genre, difficulty = 'mid', scaleMode, arrangeStyle = 'standard' } = options;
+  const preset     = genre ? (GENRE_PRESETS?.[genre] ?? null) : null;
+  const constraint = MELODY_CONSTRAINTS[difficulty] ?? MELODY_CONSTRAINTS.mid;
+
+  // [Lyrical] 叙情モードでは初級もquarterではなくeighthベース（長音は_buildRhythmicMotif側で制御）
+  const rhythm    = (difficulty === 'low' && arrangeStyle !== 'lyrical') ? 'quarter'
+                  : options.rhythm ?? preset?.rhythm ?? 'eighth';
+  const direction = options.direction ?? preset?.direction ?? 'arch';
+  const resolvedScaleMode = scaleMode ?? preset?.scaleMode ?? 'major';
+
+  const melodyLow  = constraint.melodyLow;
+  const melodyHigh = constraint.melodyHigh;
+
+  const score = buildScoreFromChords(chordNames, key, {
+    style:        'melody',
+    rhythm,
+    direction,
+    melodyLow,
+    melodyHigh,
+    scaleMode:    resolvedScaleMode,
+    genre:        null,
+    endingType:   options.endingType   ?? 'stable',   // [BugB] P1-8 終止タイプを転送
+    phraseLens:   options.phraseLens   ?? null,        // [BugB] 可変フレーズ長を転送
+    arrangeStyle: arrangeStyle,                        // [Lyrical] 叙情スタイルを転送
+  });
+
+  const events = [];
+  // [B2] measureインデックスをここで正確に付与
+  score.measures.forEach((m, mi) => {
+    m.melody.forEach(note => {
+      if (note.type === 'rest') return;
+
+      // [B-3] フレット超過時: 別弦での代替を試みる（初級で音符が消えるのを防ぐ）
+      let noteMidi = note.midi;
+      let noteFret = note.fret;
+      let si       = note.stringIdx;
+
+      if (noteFret !== null && noteFret > constraint.maxFret) {
+        // preferredStrings の中でmaxFret以内のフレットを探す
+        const altOpts = midiToFretOptions(noteMidi)
+          .filter(o => constraint.preferredStrings.includes(o.stringIdx)
+                    && o.fret <= constraint.maxFret);
+        if (altOpts.length > 0) {
+          si       = altOpts[0].stringIdx;
+          noteFret = altOpts[0].fret;
+        } else {
+          // [B-3] 開放弦30%保証: 全弦でmaxFret以内のフレットを探す
+          const anyOpts = midiToFretOptions(noteMidi)
+            .filter(o => o.fret <= constraint.maxFret);
+          if (anyOpts.length > 0) {
+            // 開放弦(fret=0)を優先（初級の開放弦30%品質基準）
+            const openOpts = anyOpts.filter(o => o.fret === 0);
+            const pick = (difficulty === 'low' && openOpts.length > 0) ? openOpts[0] : anyOpts[0];
+            si       = pick.stringIdx;
+            noteFret = pick.fret;
+            noteMidi = fretToMidi(pick.stringIdx, pick.fret); // MIDIも更新
+          } else {
+            // [S1] return廃止: オクターブ下げて再試行（フレーズの穴をなくす）
+            const octaveDown   = noteMidi - 12;
+            const octaveDownOpts = octaveDown >= 48
+              ? midiToFretOptions(octaveDown).filter(o => o.fret <= constraint.maxFret)
+              : [];
+            if (octaveDownOpts.length > 0) {
+              const pick = octaveDownOpts[0];
+              si       = pick.stringIdx;
+              noteFret = pick.fret;
+              noteMidi = fretToMidi(pick.stringIdx, pick.fret);
+            } else {
+              // それでも弾けない場合のみスキップ（実質ほぼ発生しない）
+              return;
+            }
+          }
+        }
+      }
+      if (si !== null && !constraint.preferredStrings.includes(si)) {
+        const opts = midiToFretOptions(note.midi)
+          .filter(o => constraint.preferredStrings.includes(o.stringIdx)
+                    && o.fret <= constraint.maxFret);
+        if (opts.length > 0) si = opts[0].stringIdx;
+      }
+
+      events.push(makeSoloEvent({
+        beat:        note.beat,
+        duration:    note.duration,
+        voice:       'melody',
+        stringIdx:   si,
+        fret:        noteFret ?? 0,
+        midi:        noteMidi,
+        role:        note.role,
+        technique:   note.technique ?? 'normal',
+        playStyle:   'picking',
+        // メロディエンジン(js_melodyEngine)で計算した emphasis を優先して引き継ぐ。
+        // note.emphasis が未設定の場合のみ role ベースのフォールバック値を使う。
+        emphasis:    note.emphasis ?? (['root','stable'].includes(note.role) ? 1.2 : 1.0),
+        tieOut:      note.tieOut      ?? false,  // [Lyrical] タイ引き継ぎ
+        sustainHint: note.sustainHint ?? false,  // [Lyrical] 余韻ヒント引き継ぎ
+        _measureIdx: mi,
+      }));
+    });
+  });
+
+  return events;
+}
+
+// ---------------------------------------------------------------
+// Phase S2-A: selectVoicing
+// ---------------------------------------------------------------
+
+/**
+ * ボイシング選択
+ *
+ * [P2-7] prevFrets を受け取り、演奏可能な候補を全て収集した後、
+ *        calcTransitionCost() でソートして最も移動コストの低いものを返す。
+ *        prevFrets が null（曲頭）の場合は従来どおり最初の適合候補を返す。
+ *
+ * [Lyrical×High] arrangeStyle='lyrical' かつ difficulty='high' の場合:
+ *   Step 3.5 カンパネラ評価を追加する。
+ *   同音を別弦に持ち、かつ隣接弦で音が重なって響く（ハープ的）フォームを
+ *   優先するため、その候補の priority を下げて（値を小さくして）採用されやすくする。
+ *
+ * @param {string}       chordName
+ * @param {number}       melodyMidi
+ * @param {string}       difficulty
+ * @param {string}       key
+ * @param {number[]|null} prevFrets  前小節のフレット配列 [G,C,E,A]（なければnull）
+ * @param {string}       arrangeStyle  'standard'|'lyrical'（省略='standard'）
+ */
+function selectVoicing(chordName, melodyMidi, difficulty, key, prevFrets = null, arrangeStyle = 'standard') {
+  const maxFret   = MELODY_CONSTRAINTS[difficulty]?.maxFret ?? 7;
+  const struct    = getChordStructure(chordName);
+  const isLyrical = arrangeStyle === 'lyrical';
+  const isHigh    = difficulty === 'high';
+  if (!struct) return { frets: [0,0,0,0], source: 'fallback', voiceStrings: [] };
+
+  const candidates = getChordCandidates(chordName, key, 'low');
+  const melodyOnA  = melodyMidi - SOLO_OPEN_MIDI[3];
+  const melodyOnE  = melodyMidi - SOLO_OPEN_MIDI[2];
+
+  // playability チェック：スパン>4なら不採用
+  const _playable = (frets) => {
+    const p = scorePlayability(frets);
+    return !p.issues.includes('span_too_wide');
+  };
+
+  // 有効な候補をすべて収集する
+  const validCandidates = [];
+
+  // Step 1: A弦でメロディが弾けるフォームがそのまま存在
+  for (const cand of candidates) {
+    if (melodyOnA >= 0 && melodyOnA <= maxFret && cand.frets[3] === melodyOnA) {
+      if (cand.frets.every(f => f <= maxFret) && _playable(cand.frets)) {
+        validCandidates.push({ frets: cand.frets, source: cand.source, voiceStrings: [0,1,2,3], priority: 0 });
+      }
+    }
+  }
+
+  // Step 2: 既存フォームのA弦フレットをmelodyOnAに置換
+  for (const cand of candidates) {
+    if (melodyOnA >= 0 && melodyOnA <= maxFret) {
+      const newFrets = [...cand.frets];
+      newFrets[3] = melodyOnA;
+      if (newFrets.every(f => f <= maxFret) && _playable(newFrets)) {
+        validCandidates.push({ frets: newFrets, source: cand.source + '_mel', voiceStrings: [0,1,2,3], priority: 1 });
+      }
+    }
+  }
+
+  // Step 3: E弦にメロディを配置
+  if (melodyOnE >= 0 && melodyOnE <= maxFret) {
+    const rootFretC = _findFretForPc(1, struct.rootPc, maxFret);
+    const fivePc    = (struct.rootPc + 7) % 12;
+    const fiveFretG = _findFretForPc(0, fivePc, maxFret);
+    const eFrets = [fiveFretG ?? 0, rootFretC ?? 0, melodyOnE, 0];
+    if (_playable(eFrets)) {
+      validCandidates.push({ frets: eFrets, source: 'e_mel', voiceStrings: [1,2], priority: 2 });
+    }
+  }
+
+  // [Lyrical×High] Step 3.5: カンパネラ優先ボイシング
+  // 開放弦を含み、かつ隣接弦に同一音名（PC）が存在するフォームを探す。
+  // そのようなフォームは「鳴らした音が次の音と重なって響くハープ的効果」を生む。
+  if (isLyrical && isHigh) {
+    for (const cand of candidates) {
+      if (!cand.frets.every(f => f <= maxFret)) continue;
+      if (!_playable(cand.frets)) continue;
+      const hasOpen = cand.frets.some(f => f === 0);
+      if (!hasOpen) continue;
+      // 隣接弦間で同一PC（音名）が存在するか検査
+      let hasCampanella = false;
+      for (let si = 0; si < 3; si++) {
+        const pcA = fretToMidi(si, cand.frets[si]) % 12;
+        const pcB = fretToMidi(si + 1, cand.frets[si + 1]) % 12;
+        if (pcA === pcB) { hasCampanella = true; break; }
+      }
+      if (hasCampanella) {
+        // メロディ音がA弦またはE弦に乗っていれば採用
+        const newFrets = [...cand.frets];
+        if (melodyOnA >= 0 && melodyOnA <= maxFret) newFrets[3] = melodyOnA;
+        if (_playable(newFrets)) {
+          // priority を -1 にして最優先候補にする
+          validCandidates.push({
+            frets:        newFrets,
+            source:       cand.source + '_campanella',
+            voiceStrings: [0,1,2,3],
+            priority:     -1,
+          });
+        }
+      }
+    }
+  }
+
+  // [P2-7] prevFretsがある場合: 移動コストでソートして最適候補を返す
+  if (prevFrets && validCandidates.length > 1) {
+    validCandidates.sort((a, b) => {
+      // まず priority（Step順）で比較
+      if (a.priority !== b.priority) return a.priority - b.priority;
+      // 同 priority 内では移動コストで比較
+      const costA = calcTransitionCost(prevFrets, a.frets).cost;
+      const costB = calcTransitionCost(prevFrets, b.frets).cost;
+      return costA - costB;
+    });
+  }
+
+  if (validCandidates.length > 0) return validCandidates[0];
+
+  // Step 4: フォールバック（メロディ+ベースの2声）
+  const rootFretC  = _findFretForPc(1, struct.rootPc, maxFret);
+  const melodyFret = melodyOnA >= 0 && melodyOnA <= maxFret ? melodyOnA
+                   : (melodyOnE >= 0 && melodyOnE <= maxFret ? melodyOnE : 0);
+  const melodyStr  = melodyOnA >= 0 && melodyOnA <= maxFret ? 3 : 2;
+  const frets      = [0, rootFretC ?? 0, 0, 0];
+  if (melodyStr === 3) frets[3] = melodyFret;
+  else                 frets[2] = melodyFret;
+  return { frets, source: 'fallback', voiceStrings: [melodyStr, 1] };
+}
+
+function _findFretForPc(si, targetPc, maxFret = 12) {
+  for (let f = 0; f <= maxFret; f++) {
+    if (fretToMidi(si, f) % 12 === targetPc) return f;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------
+// Phase S2-B: buildBassLine
+//
+// [P1-5] ジャンル対応ベースパターンを追加:
+//   root_only  : 従来どおり beat:1 にルート1音（ballad等）
+//   root_fifth : beat:1 にルート、beat:3 に5度（pop/folk/rock/bossa/hawaiian）
+//   approach   : beat:1 にルート、小節末(beat:3.5)に次コードへの半音接近音（rnb）
+//   walking    : beat:1 root → beat:2 root → beat:3 5度 → beat:3.5 接近音（jazz/blues）
+//
+// genre引数を追加し、SOLO_GENRE_TECHNIQUESのbassPatternを参照する。
+// voicingCFrets によるC弦フレット優先制御は従来通り維持。
+// ---------------------------------------------------------------
+
+function buildBassLine(chordNames, key, melodyTrack, difficulty, voicingCFrets, genre, arrangeStyle) {
+  const maxFret   = MELODY_CONSTRAINTS[difficulty]?.maxFret ?? 7;
+  const pattern   = (genre && SOLO_GENRE_TECHNIQUES[genre]?.bassPattern) ?? 'root_only';
+  const isLyrical = arrangeStyle === 'lyrical';
+  const events    = [];
+
+  // [Lyrical] ペダルポイント用: 前小節のルートフレットを記憶
+  let prevRootFret = null;
+
+  // ルートフレットを決定するサブ関数（voicingCFrets優先ロジック）
+  function resolveRootFret(struct, mi) {
+    if (voicingCFrets && voicingCFrets[mi] !== undefined) {
+      const vFret = voicingCFrets[mi];
+      const vPc   = fretToMidi(1, vFret) % 12;
+      return (vPc === struct.rootPc)
+        ? vFret
+        : (_findFretForPc(1, struct.rootPc, maxFret) ?? vFret);
+    }
+    const f = _findFretForPc(1, struct.rootPc, maxFret);
+    if (f !== null) return f;
+    const f2 = _findNearestChordToneFret(1, struct, maxFret);
+    return f2 ?? 0;
+  }
+
+  function pushBassEvent(mi, beat, dur, fret, role, emphasis = 1.0) {
+    events.push(makeSoloEvent({
+      beat,
+      duration:    dur,
+      voice:       'bass',
+      stringIdx:   1,
+      fret,
+      midi:        fretToMidi(1, fret),
+      role,
+      technique:   'normal',
+      playStyle:   'picking',
+      emphasis,
+      _measureIdx: mi,
+    }));
+  }
+
+  chordNames.forEach((chordName, mi) => {
+    const struct = getChordStructure(chordName);
+    if (!struct) return;
+
+    const rootFret   = resolveRootFret(struct, mi);
+    const nextStruct = mi + 1 < chordNames.length
+      ? getChordStructure(chordNames[mi + 1]) : null;
+
+    // [Lyrical] ペダルポイント判定:
+    // 叙情モードで前のルートと同じフレットが次小節でも有効なコードトーンなら保持
+    // （ベースが動かずメロディだけが動く切なさ）
+    if (isLyrical && prevRootFret !== null && prevRootFret === rootFret) {
+      // 同フレット継続 → ルートのみ発音（root_onlyに縮退して余白を作る）
+      pushBassEvent(mi, 1, 1.0, rootFret, 'root', 0.85);
+      prevRootFret = rootFret;
+      return;
+    }
+
+    switch (pattern) {
+
+      case 'root_fifth': {
+        // beat:1 ルート（強調）、beat:3 に5度音（低音の揺れ感）
+        pushBassEvent(mi, 1, 1.0, rootFret, 'root', 1.0);
+        const fifthFret = _findFifthFret(1, struct.rootPc, maxFret);
+        if (fifthFret !== null && fifthFret !== rootFret) {
+          pushBassEvent(mi, 3, 1.0, fifthFret, 'stable', 0.8);
+        } else {
+          // 5度が見つからない場合はルートをbeat:3に繰り返す
+          pushBassEvent(mi, 3, 1.0, rootFret, 'root', 0.75);
+        }
+        break;
+      }
+
+      case 'walking': {
+        // beat:1 root → beat:2 root → beat:3 5度 → beat:3.5 接近音
+        const beats = _buildWalkingBeats(1, struct, nextStruct, maxFret);
+        beats.forEach(b => pushBassEvent(mi, b.beat, b.dur, b.fret, b.role,
+          b.role === 'root' ? 1.0 : 0.75));
+        break;
+      }
+
+      case 'approach': {
+        // beat:1 ルート、小節末に次コードへの半音接近
+        pushBassEvent(mi, 1, 1.0, rootFret, 'root', 1.0);
+        if (nextStruct) {
+          const approachFret = _findApproachFret(1, nextStruct.rootPc, maxFret);
+          if (approachFret !== null) {
+            pushBassEvent(mi, 3.5, 0.5, approachFret, 'passing', 0.7);
+          }
+        }
+        break;
+      }
+
+      default: // 'root_only'
+        // 従来どおり beat:1 にルート1音
+        pushBassEvent(mi, 1, 1.0, rootFret, 'root', 1.0);
+        break;
+    }
+
+    prevRootFret = rootFret;
+  });
+
+  return events;
+}
+
+function _findNearestChordToneFret(si, struct, maxFret = 12) {
+  for (let f = 0; f <= maxFret; f++) {
+    const pc     = fretToMidi(si, f) % 12;
+    const offset = (pc - struct.rootPc + 12) % 12;
+    if (offset in struct.intervals) return f;
+  }
+  return null;
+}
+
+
+// ---------------------------------------------------------------
+// [A-1] 演奏可能性スコア
+// フレットスパン > 4 やバレー必要を検出してフォールバックを促す
+// ---------------------------------------------------------------
+
+/**
+ * [P2-7] 単一コードの演奏可能性スコア（従来機能を維持）
+ *
+ * @param {number[]} frets  [G, C, E, A] フレット配列
+ * @returns {{ score: number, issues: string[] }}
+ *   score: 0-100（100=問題なし）
+ *   issues: 'span_too_wide' | 'wide_span' | 'barre_required'
+ */
+// ===================================================================
+// [Mid-1] ポジション・ブロック機能
+//
+// ウクレレは左手1ポジションで4フレット（人差し指〜小指）をカバーする。
+// フレーズが跨ぐフレット幅が4を超える場合、ポジション移動が発生し
+// 演奏の安定性が下がる。
+//
+// _applyPositionBlock() は小節単位でメロディイベントのフレット幅を計算し、
+// 幅が BLOCK_WIDTH(=4) を超えるフレーズに対して
+// 「フレット重心に近い代替フレット」への再マッピングを試みる。
+//
+// 処理フロー:
+//   1. 小節内メロディのフレット幅を計算
+//   2. 幅 ≤ BLOCK_WIDTH なら何もしない
+//   3. 幅 > BLOCK_WIDTH の場合、フレット重心 (avg) を基準とする
+//      [minPos, minPos+4] ウィンドウを決定
+//   4. 範囲外のフレットを持つ音符を、同音程 (PC) で範囲内のフレットに
+//      再マッピング（なければ最も近い開放弦側に寄せる）
+//   5. bassEvents の弦と競合する場合はスキップ
+// ===================================================================
+
+const POSITION_BLOCK_WIDTH = 4;  // 1ポジションでカバーできるフレット幅
+
+/**
+ * 小節単位でメロディのポジションを4フレット幅に正規化する。
+ *
+ * @param {SoloEvent[]} melodyEvents   melody voice のイベント配列
+ * @param {SoloEvent[]} bassEvents     bass voice のイベント配列（競合チェック用）
+ * @param {number}      totalMeasures
+ * @returns {SoloEvent[]}  正規化後のmelodyEvents（新配列）
+ */
+function _applyPositionBlock(melodyEvents, bassEvents, totalMeasures, options = {}) {
+  // [repair-4] importパスからのスキップ指示を受け付ける
+  // MIDIインポート時は「開放弦+高フレットメロディ」の組み合わせが正当なため
+  // PositionBlockを適用しない（フレット位置を保護する）
+  if (options._skipPositionBlock) return melodyEvents;
+
+  const result    = melodyEvents.map(e => ({ ...e }));
+  const OPEN_MIDI = [67, 60, 64, 69]; // G, C, E, A（関数スコープで1回だけ定義）
+
+  for (let mi = 0; mi < totalMeasures; mi++) {
+    // 開放弦(0F)を除いた押弦音のみでフレット幅を計算
+    // 開放弦は常にどのポジションからでも弾けるため幅計算に含めない
+    const indices = result
+      .map((e, i) => ({ e, i }))
+      .filter(({ e }) => e._measureIdx === mi && e.fret !== null && e.fret > 0);
+
+    if (indices.length < 2) continue;
+
+    const frets = indices.map(({ e }) => e.fret);
+    const minF  = Math.min(...frets);
+    const maxF  = Math.max(...frets);
+    if (maxF - minF <= POSITION_BLOCK_WIDTH) continue;  // 既に4F以内 → スキップ
+
+    // フレット重心を計算してウィンドウを決定
+    const avg    = frets.reduce((s, f) => s + f, 0) / frets.length;
+    const minPos = Math.max(1, Math.round(avg - POSITION_BLOCK_WIDTH / 2));
+    const maxPos = minPos + POSITION_BLOCK_WIDTH;
+
+    // bass が使っている弦のセット（競合防止）
+    const bassStrings = new Set(
+      bassEvents.filter(e => e._measureIdx === mi).map(e => e.stringIdx)
+    );
+
+    indices.forEach(({ e, i }) => {
+      if (e.fret >= minPos && e.fret <= maxPos) return;  // 範囲内 → 変更不要
+
+      // 同じ音程(PC)でウィンドウ内のフレットを探す
+      const pc = e.midi % 12;
+
+      let remapped  = false;
+      let bestDist  = Infinity;
+      let bestSi    = -1;
+      let bestF     = e.fret;
+
+      for (let si = 0; si < 4; si++) {
+        for (let f = minPos; f <= maxPos; f++) {
+          if ((OPEN_MIDI[si] + f) % 12 !== pc) continue;
+          if (bassStrings.has(si)) continue;  // bass競合 → スキップ
+          const dist = Math.abs(f - e.fret);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestSi   = si;
+            bestF    = f;
+            remapped = true;
+          }
+        }
+      }
+
+      if (remapped) {
+        // ウィンドウ内に同PCが見つかった → 最小コスト位置に再マッピング
+        result[i] = {
+          ...result[i],
+          stringIdx: bestSi,
+          fret:      bestF,
+          midi:      OPEN_MIDI[bestSi] + bestF,
+        };
+      } else {
+        // 同PCが見つからない場合は最も近いウィンドウ端に寄せる
+        const clampedFret = e.fret < minPos ? minPos : maxPos;
+        result[i] = { ...result[i], fret: clampedFret };
+      }
+    });
+  }
+
+  return result;
+}
+
+// ===================================================================
+// [Mid-2] テクスチャ密度の動的設計
+//
+// 小節内のメロディから「緊張度」を計算し、
+// 内声（inner）の音数・強調度を動的に調整する。
+//
+// 緊張度 (tension: 0.0〜1.0) の計算要素:
+//   - メロディの音程幅（フレット幅 / POSITION_BLOCK_WIDTH）
+//   - 音数（notes / 8 ）
+//   - 最高フレットがハイライト・エリア（7F+）かどうか
+//
+// tension に応じた密度マップ:
+//   0.0〜0.3  → 緩和: inner音を1音 + emphasis低め（空白を作る）
+//   0.3〜0.6  → 通常: inner音を標準数
+//   0.6〜1.0  → 緊張: inner音を増やし + emphasisを上げる
+// ===================================================================
+
+/**
+ * 小節のメロディイベントから緊張度を計算する。
+ *
+ * @param {SoloEvent[]} melEventsInMeasure  その小節のメロディイベント
+ * @returns {number}  0.0〜1.0 の緊張度
+ */
+function _calcMeasureTension(melEventsInMeasure) {
+  if (melEventsInMeasure.length === 0) return 0;
+
+  const frets     = melEventsInMeasure.map(e => e.fret ?? 0);
+  const fretSpan  = Math.max(...frets) - Math.min(...frets);
+  const maxFret   = Math.max(...frets);
+  const noteCount = melEventsInMeasure.length;
+
+  // 各要素を0〜1に正規化して合成
+  const spanScore   = Math.min(fretSpan / (POSITION_BLOCK_WIDTH * 2), 1.0);
+  const countScore  = Math.min(noteCount / 8, 1.0);
+  const highlightSc = maxFret >= 7 ? 0.3 : 0;
+
+  return Math.min(spanScore * 0.4 + countScore * 0.3 + highlightSc, 1.0);
+}
+
+// ===================================================================
+// [Mid-3] A弦フレーズ終止
+//
+// メロディのフレーズ終止音（小節の最後の音でrole='root'）に対して
+// A弦(si=3)でのフレット位置を優先的に割り当てる。
+//
+// 理由: A弦は最も外側で強くアタックしやすく、終止の安定感を出しやすい。
+// HighGチューニングでは A弦の音域(A4〜A5: MIDI69〜81)がメロディの
+// 中核帯域と一致するため、自然な終止感が得られる。
+//
+// 条件:
+//   - voice='melody' かつ小節内最終音
+//   - role='root' or role='stable'
+//   - A弦(si=3)でフレット0〜12に収まる
+//   - bass声部がA弦を使っていない
+// ===================================================================
+
+/**
+ * フレーズ終止音をA弦優先に再マッピングする。
+ *
+ * @param {SoloEvent[]} melodyEvents
+ * @param {SoloEvent[]} bassEvents
+ * @param {number}      totalMeasures
+ * @returns {SoloEvent[]}
+ */
+function _applyAStringCadence(melodyEvents, bassEvents, totalMeasures) {
+  const result = melodyEvents.map(e => ({ ...e }));
+  const A_STRING_OPEN = 69; // A4
+
+  for (let mi = 0; mi < totalMeasures; mi++) {
+    const indices = result
+      .map((e, i) => ({ e, i }))
+      .filter(({ e }) => e._measureIdx === mi && e.voice === 'melody')
+      .sort((a, b) => a.e.beat - b.e.beat);
+
+    if (indices.length === 0) continue;
+
+    const last = indices[indices.length - 1];
+    const ev   = last.e;
+
+    // [repair-6] 同拍に複数音がある場合（コード弾き）はスキップ
+    // コード弾きのA弦だけ移動するとコード形が崩れる
+    const sameBeats = result.filter(e =>
+      e._measureIdx === mi && Math.abs(e.beat - ev.beat) < 0.06
+    );
+    if (sameBeats.length > 1) continue;
+
+    // 終止条件: root または stable で、かつフレーズの末尾
+    if (ev.role !== 'root' && ev.role !== 'stable') continue;
+
+    // A弦でこのMIDIが弾けるか確認
+    const aFret = ev.midi - A_STRING_OPEN;
+    if (aFret < 0 || aFret > 12) continue;
+
+    // bass がA弦を使っていたらスキップ
+    const bassUsesA = bassEvents.some(
+      e => e._measureIdx === mi && e.stringIdx === 3
+    );
+    if (bassUsesA) continue;
+
+    // 既にA弦ならスキップ
+    if (ev.stringIdx === 3) continue;
+
+    // A弦に再マッピング
+    result[last.i] = {
+      ...result[last.i],
+      stringIdx: 3,
+      fret:      aFret,
+      midi:      A_STRING_OPEN + aFret,
+    };
+  }
+
+  return result;
+}
+
+function scorePlayability(frets) {
+  const pressed = frets.filter(f => f > 0);
+  const issues  = [];
+  let   score   = 100;
+
+  if (pressed.length > 0) {
+    const span = Math.max(...pressed) - Math.min(...pressed);
+    if (span > 4) {
+      issues.push('span_too_wide');
+      score -= 30 * (span - 4); // 5F差→-30, 6F差→-60
+    } else if (span > 2) {
+      issues.push('wide_span');
+      score -= 10;
+    }
+  }
+
+  // バレーチェック: 3弦以上が同一フレット
+  const freqMap = {};
+  pressed.forEach(f => { freqMap[f] = (freqMap[f] || 0) + 1; });
+  if (Object.values(freqMap).some(c => c >= 3)) {
+    issues.push('barre_required');
+    score -= 15;
+  }
+
+  return { score: Math.max(0, score), issues };
+}
+
+/**
+ * [P2-7] コード間の移動コストを計算する。
+ *
+ * 前コードから次コードへの押さえ替えしやすさを 0〜100 で返す。
+ * 100 = 移動ゼロ（同じフォーム）, 0 = 最大コスト。
+ *
+ * 評価項目:
+ *   1. 共通フレット数: 同弦・同フレットをそのまま維持できる指が多いほど良い
+ *   2. ポジション移動量: 押さえているフレットの重心差（大きいほどコスト高）
+ *   3. 開放弦利用: 次コードに開放弦が多ければ移動が楽
+ *   4. バレー連続: 両コードともバレーが必要な場合は追加コスト
+ *
+ * @param {number[]} fretsA  前コードの [G, C, E, A] フレット配列
+ * @param {number[]} fretsB  次コードの [G, C, E, A] フレット配列
+ * @returns {{ cost: number, movability: number, commonFrets: number }}
+ *   cost:        移動コスト (0〜100、0=最小)
+ *   movability:  演奏しやすさスコア (100=最良)
+ *   commonFrets: 同弦・同フレット保持できる数
+ */
+function calcTransitionCost(fretsA, fretsB) {
+  // ① 共通フレット数（同弦・同フレット）
+  let commonFrets = 0;
+  for (let si = 0; si < 4; si++) {
+    if (fretsA[si] === fretsB[si] && fretsA[si] > 0) commonFrets++;
+  }
+
+  // ② ポジション重心の移動距離
+  const pressedA = fretsA.filter(f => f > 0);
+  const pressedB = fretsB.filter(f => f > 0);
+  const centA = pressedA.length > 0 ? pressedA.reduce((s, f) => s + f, 0) / pressedA.length : 0;
+  const centB = pressedB.length > 0 ? pressedB.reduce((s, f) => s + f, 0) / pressedB.length : 0;
+  const centDist = Math.abs(centB - centA);
+
+  // ③ 次コードの開放弦利用率
+  const openCount = fretsB.filter(f => f === 0).length;
+
+  // ④ 連続バレー判定
+  const { issues: issuesA } = scorePlayability(fretsA);
+  const { issues: issuesB } = scorePlayability(fretsB);
+  const bothBarre = issuesA.includes('barre_required') && issuesB.includes('barre_required');
+
+  // コスト計算
+  let cost = 0;
+  cost += Math.min(centDist * 8, 40);       // 重心移動: 最大40
+  cost -= commonFrets * 12;                  // 共通フレット: 1本ごとに-12
+  cost -= openCount * 5;                     // 開放弦: 1本ごとに-5
+  if (bothBarre) cost += 15;                // 連続バレー加算
+
+  cost = Math.max(0, Math.min(100, cost));
+
+  return {
+    cost,
+    movability: 100 - cost,
+    commonFrets,
+  };
+}
+
+// ---------------------------------------------------------------
+// Phase S2-C: buildInnerVoices
+//
+// [P1-6] 声部進行ルールを追加:
+//   1. 共通音保持: 前小節の内声音がコードトーンとして次小節でも有効なら、
+//      できるだけ同フレット(同音)を維持する
+//   2. 隣接進行: 動く場合は移動量を最小化（フレット差が最小のポジションを選ぶ）
+//   3. high難易度でE弦(si=2)にcolor音を追加（従来どおり）
+// ---------------------------------------------------------------
+
+function buildInnerVoices(melodyEvents, bassEvents, chordFretsArray, difficulty, chordOnly = false, thumbPicking = false) {
+  // chord_only / thumbPicking: 難易度に関わらず内声を生成する
+  if (difficulty === 'low' && !chordOnly && !thumbPicking) return [];
+  // chord_only/thumbPicking時はmid扱いで内声を生成
+  const effectiveDiff = (chordOnly || thumbPicking) ? 'mid' : difficulty;
+
+  const events = [];
+
+  // 前小節の内声フレット記憶: { si: fret }
+  const prevInnerFrets = {};
+
+  chordFretsArray.forEach((frets, mi) => {
+    // この小節でmelody/bassが使っている弦インデックスの集合
+    const usedStrings = new Set([
+      ...melodyEvents.filter(e => e._measureIdx === mi).map(e => e.stringIdx),
+      ...bassEvents.filter(e => e._measureIdx === mi).map(e => e.stringIdx),
+      ]);
+      // chord_only: bass(C弦si=1)以外も内声に使えるよう開放
+      if (chordOnly) usedStrings.delete(1);
+
+    // 内声候補を弦ごとに決定するサブ関数
+    // [P1-6] 声部進行ルールを適用してフレットを選ぶ
+    function resolveInnerFret(si, voicingFret) {
+      const newMidi   = fretToMidi(si, voicingFret);
+      const newPc     = newMidi % 12;
+      const prevFret  = prevInnerFrets[si] ?? null;
+
+      // [Open-1] 開放弦優先ルール:
+      //   voicingFret のピッチクラス(PC)と同じ音が開放弦で出るなら開放弦を選ぶ。
+      //   ウクレレの共鳴を最大化し、「ベースライン・エリア（0〜5F）」の
+      //   響きを豊かにする。G弦(si=0, MIDI67=G4), C弦(si=1, MIDI60=C4),
+      //   E弦(si=2, MIDI64=E4), A弦(si=3, MIDI69=A4) の開放音PCと一致すれば0Fを使う。
+      const openPc = fretToMidi(si, 0) % 12;
+      if (newPc === openPc) return 0;
+
+      if (prevFret === null) return voicingFret; // 前履歴なし→voicingそのまま
+
+      const prevMidi = fretToMidi(si, prevFret);
+      const prevPc   = prevMidi % 12;
+
+      // ① 共通音保持: 前の音がそのまま今のコードトーンになっているなら据え置き
+      if (prevPc === newPc) return prevFret;
+
+      // ② 隣接進行: ±1〜2フレットに同じコードトーン（PC）があれば最小移動先へ
+      const maxFret = 12;
+      let bestFret = voicingFret;
+      let bestDist  = Math.abs(voicingFret - prevFret);
+      for (let f = Math.max(0, prevFret - 2); f <= Math.min(maxFret, prevFret + 2); f++) {
+        const fPc = fretToMidi(si, f) % 12;
+        if (fPc === newPc && Math.abs(f - prevFret) < bestDist) {
+          bestFret = f;
+          bestDist = Math.abs(f - prevFret);
+        }
+      }
+      return bestFret;
+    }
+
+    function pushInner(si, fret, role, beat, dur, emphasis) {
+      const resolvedFret = resolveInnerFret(si, fret);
+      prevInnerFrets[si]  = resolvedFret; // 履歴を更新
+      events.push(makeSoloEvent({
+        beat,
+        duration:    dur,
+        voice:       'inner',
+        stringIdx:   si,
+        fret:        resolvedFret,
+        midi:        fretToMidi(si, resolvedFret),
+        role,
+        technique:   'normal',
+        playStyle:   'arpeggio',
+        emphasis,
+        _measureIdx: mi,
+      }));
+    }
+
+    // [Mid-2] 緊張度を計算して内声の密度を動的に変える
+    const melInMeasure = melodyEvents.filter(e => e._measureIdx === mi);
+    const tension      = _calcMeasureTension(melInMeasure);
+
+    // 緊張度に応じた強調度スケール
+    //   緩和(0〜0.3): emphasisを落とし音数を減らす → 開放感・空白を作る
+    //   通常(0.3〜0.6): 標準
+    //   緊張(0.6〜1.0): emphasisを上げ音数を増やす → 音の密度が増す
+    const empScale = tension < 0.3 ? 0.5
+                   : tension < 0.6 ? 0.7
+                   : 0.85;
+
+    if (effectiveDiff === 'mid') {
+      // 緩和時は内声を省略（chord_only / thumbPicking 時は省略しない）
+      if (!chordOnly && !thumbPicking && tension < 0.3 && melInMeasure.length > 0) return;
+
+      if (thumbPicking) {
+        // ─── 親指ピッキング向けコード配置（超シンプル版）──────────────
+        //
+        // 設計方針:
+        //   - G弦(si=0)・C弦(si=1) のみを内声に使う（E/A弦はメロディ優先）
+        //   - G/C は互いに隣接（距離1）なので G/C 間では飛び弦にならない
+        //
+        // [Fix-Adjacent] 飛び弦防止:
+        //   同拍の melody 弦との最小距離が 2 以上になる場合は inner をスキップする。
+        //   例: melody が A弦(si=3) → C弦(si=1) inner との距離=2 → スキップ
+        //       melody が E弦(si=2) → C弦(si=1) inner との距離=1 → OK
+        //       melody が E弦(si=2) → G弦(si=0) inner との距離=2 → スキップ
+        //       melody が C弦(si=1) → G弦(si=0) inner との距離=1 → OK
+        //   これにより inner と melody が同拍に1弦以上の間隔で共存することがなくなる。
+
+        // beat1（1拍目）の melody 弦セット
+        const melBeat1Si = melInMeasure
+          .filter(e => e.beat >= 1 && e.beat < 2)
+          .map(e => e.stringIdx);
+        // inner の弦 si と同拍 melody 弦の最小距離が 1 以下なら置いてよい
+        const canPlace1 = (si) => melBeat1Si.length === 0
+          || melBeat1Si.some(ms => Math.abs(si - ms) <= 1);
+
+        if (!usedStrings.has(0) && canPlace1(0)) pushInner(0, frets[0], 'stable', 1, 0.75, empScale);
+        if (!usedStrings.has(1) && canPlace1(1)) pushInner(1, frets[1], 'stable', 1, 0.75, empScale * 0.9);
+
+        if (tension >= 0.5) {
+          // beat3（3拍目）の melody 弦セット
+          const melBeat3Si = melInMeasure
+            .filter(e => e.beat >= 3 && e.beat < 4)
+            .map(e => e.stringIdx);
+          const canPlace3 = (si) => melBeat3Si.length === 0
+            || melBeat3Si.some(ms => Math.abs(si - ms) <= 1);
+          if (!usedStrings.has(0) && canPlace3(0)) pushInner(0, frets[0], 'stable', 3, 0.5, empScale * 0.7);
+        }
+      } else if (chordOnly) {
+        // ─── コードのみモード ────────────────────────────────────────
+        // G弦(si=0)→C弦(si=1)→E弦(si=2)→A弦(si=3) の隣接4弦をすべて使う。
+        // 旧実装は G/E/A（C弦抜け）で1弦飛びが発生していた。
+        //
+        // メロディを加味したコード:
+        //   melodyEvents には chord_only 時もメロディ音程が渡されている
+        //   （buildSoloScore 側で _chordOnly 時も melodyTrack を buildInnerVoices に渡す）。
+        //   usedStrings によりメロディが使う弦には inner を重ねず、
+        //   空き弦にコードトーンを配置することでメロディの音程を引き立てる。
+        //
+        // beat1: 全4弦を配置（usedStrings で空き弦のみ）
+        if (!usedStrings.has(0)) pushInner(0, frets[0], 'root',   1, 2.0, empScale);
+        if (!usedStrings.has(1)) pushInner(1, frets[1], 'stable', 1, 2.0, empScale * 0.95);
+        if (!usedStrings.has(2)) pushInner(2, frets[2], 'color',  1, 2.0, empScale * 0.9);
+        if (!usedStrings.has(3)) pushInner(3, frets[3], 'stable', 1, 2.0, empScale * 0.85);
+        // beat3: G弦・C弦（中間アクセント）
+        if (tension >= 0.3) {
+          if (!usedStrings.has(0)) pushInner(0, frets[0], 'root',   3, 1.0, empScale * 0.75);
+          if (!usedStrings.has(1)) pushInner(1, frets[1], 'stable', 3, 1.0, empScale * 0.7);
+        }
+      } else {
+        if (!usedStrings.has(0)) {
+          pushInner(0, frets[0], 'stable', 1, 2.0, empScale);
+        }
+        if (tension >= 0.6 && !usedStrings.has(1)) {
+          pushInner(1, frets[1], 'stable', 2, 1.0, empScale * 0.85);
+        }
+      }
+    } else if (effectiveDiff === 'high') {
+      const candidates = [
+        { si: 0, fi: 0, role: 'stable', beat: 1,   dur: 1.0 },
+        { si: 2, fi: 2, role: 'color',  beat: 1,   dur: 1.0 },
+        // 緊張時のみ追加: C弦に3拍目アクセント
+        ...(tension >= 0.6
+          ? [{ si: 1, fi: 1, role: 'stable', beat: 3, dur: 0.5 }]
+          : []),
+      ];
+      candidates.forEach(({ si, fi, role, beat, dur }) => {
+        if (usedStrings.has(si)) return;
+        pushInner(si, frets[fi], role, beat, dur, empScale);
+      });
+    }
+  });
+
+  return events;
+}
+
+// ---------------------------------------------------------------
+// Phase S3-A: resolveStringConflicts
+// ---------------------------------------------------------------
+
+function resolveStringConflicts(events) {
+  const PRIORITY = { melody: 0, bass_melody: 0, bass: 1, inner: 2 };
+  const slotMap  = new Map();
+
+  events.forEach(ev => {
+    // stringIdx が未解決のイベントは競合判定をスキップ（そのまま通す）
+    if (ev.stringIdx === null || ev.stringIdx === undefined) return;
+    // beat を8分音符グリッド(1/8拍)に丸めてから文字列化
+    // → 浮動小数点誤差で 1.5000000001 ≠ 1.5 になる問題を防ぐ
+    const beatKey = Math.round(ev.beat * 8) / 8;
+    const k    = `${ev._measureIdx}-${beatKey}-${ev.stringIdx}`;
+    const prio = PRIORITY[ev.voice] ?? 9;
+    if (!slotMap.has(k)) {
+      slotMap.set(k, { ev, prio });
+    } else if (prio < slotMap.get(k).prio) {
+      slotMap.set(k, { ev, prio });
+    }
+  });
+
+  const winners = new Set([...slotMap.values()].map(v => v.ev));
+  // stringIdx=null のイベントは競合判定対象外なのでそのまま通す
+  const resolved = events.filter(ev =>
+    ev.stringIdx === null || ev.stringIdx === undefined ? true : winners.has(ev)
+  );
+
+  // [S3] 弦変更後の奏法再計算
+  // 競合解消でstringIdxが変わった場合、前後のイベントとの整合性を再チェック
+  // melody声部のみ対象（bass/innerは奏法変化が少ない）
+  const melodyEvents = resolved
+    .filter(ev => ev.voice === 'melody')
+    .sort((a, b) => a._measureIdx !== b._measureIdx
+      ? a._measureIdx - b._measureIdx
+      : a.beat - b.beat);
+
+  let prevSi   = -1;
+  let prevFret = -1;
+  melodyEvents.forEach(ev => {
+    if (ev.stringIdx !== null && ev.fret !== null) {
+      // assignTechniqueはjs_melodyEngine.txtで定義済みのグローバル関数
+      if (typeof assignTechnique === 'function') {
+        ev.technique = assignTechnique(prevSi, prevFret, ev.stringIdx, ev.fret);
+      }
+      prevSi   = ev.stringIdx;
+      prevFret = ev.fret;
+    }
+  });
+
+  return resolved;
+}
+
+// ---------------------------------------------------------------
+// Phase S3-B: applyGenreTechniques  [N1] playStyle付与
+// ---------------------------------------------------------------
+
+function applyGenreTechniques(events, genre, difficulty, arrangeStyle, directMode = false) {
+  const tech      = genre ? (SOLO_GENRE_TECHNIQUES[genre] ?? null) : null;
+  const isLyrical = arrangeStyle === 'lyrical';
+
+  return events.map(ev => {
+    const newEv = { ...ev };
+    if (ev.voice === 'bass') {
+      if (tech?.bassStyle === 'thumb') {
+        newEv.technique = 'thumb';
+        newEv.playStyle = 'thumb';
+      }
+    } else if (ev.voice === 'inner') {
+      // [D2] directMode: JSON由来のinnerはコードトーン打音 → arpeggio
+      if (directMode) {
+        newEv.playStyle = 'arpeggio';
+      } else if (isLyrical) {
+        // [Lyrical] 叙情モードでは inner を強制的にアルペジオに
+        newEv.playStyle = 'arpeggio';
+        newEv.beat      = Math.min(ev.beat + 0.5, 4.5);
+      } else if (tech) {
+        newEv.playStyle = tech.innerStyle === 'arpeggio' ? 'arpeggio' : 'strum';
+        if (tech.innerStyle === 'arpeggio') {
+          newEv.beat = Math.min(ev.beat + 0.5, 4.5);
+        }
+      }
+    }
+    return newEv;
+  });
+}
+
+// ---------------------------------------------------------------
+// Phase S3-C: applyDifficultyFilter
+// ---------------------------------------------------------------
+
+function applyDifficultyFilter(events, difficulty, chordOnly = false, thumbPicking = false) {
+  // chord_only / thumbPicking: innerを全て通す
+  if (chordOnly || thumbPicking) return events;
+  if (difficulty === 'low') {
+    return events.filter(ev => ev.voice === 'melody' || ev.voice === 'bass');
+  }
+  if (difficulty === 'mid') {
+    return events.filter(ev => ev.voice !== 'inner' || ev.beat === 1);
+  }
+  return events;
+}
+
+// ---------------------------------------------------------------
+// Phase S3 エントリーポイント: buildSoloScore
+// [B1修正] _integrateToMeasures の eighth固定を廃止
+//          各トラックが持つ _measureIdx をそのまま利用
+// ---------------------------------------------------------------
+
+function buildSoloScore(chordNames, key, options = {}) {
+  const {
+    genre = null, difficulty = 'mid', rhythm, direction, scaleMode, seed,
+    endingType      = 'stable',   // [BugA-solo] P1-8 終止タイプ
+    phraseLens      = null,       // [BugA-solo] 可変フレーズ長
+    arrangeStyle    = 'standard', // [Lyrical] アレンジスタイル
+    externalMelody      = null,   // [Import] 外部メロディトラック（SoloEvent[]）
+    _melodyOnly         = false,  // [melody_only] trueでbass/innerを破棄
+    _chordOnly          = false,  // [chord_only] trueでmelodyを空にしてbass/innerのみ
+    _skipPositionBlock  = false,  // [import] trueでPositionBlockをスキップ
+    _thumbPicking       = false,  // [thumb] 親指ピッキング向け内声制御
+    _directMode         = false,  // [D2] direct JSONインポート: bass/inner自動生成をスキップ
+  } = options;
+  const preset    = genre ? (GENRE_PRESETS?.[genre] ?? null) : null;
+  const isLyrical = arrangeStyle === 'lyrical';
+
+  // [C-3] シードを使って擬似乱数を初期化（モチーフパターン選択に影響）
+  if (typeof seed === 'number' && seed > 0) {
+    let _state = seed >>> 0;
+    window._soloRng = function() {
+      _state = (_state * 1664525 + 1013904223) >>> 0;
+      return _state / 0x100000000;
+    };
+  } else {
+    window._soloRng = Math.random;
+  }
+
+  // Step 1: メロディ（_measureIdx付き）
+  // [Import] externalMelody が渡されている場合は自動生成をスキップして注入する
+  const melodyTrack = externalMelody
+    ? externalMelody
+    : buildMelodyTrack(chordNames, key, {
+        genre, difficulty, rhythm, direction, scaleMode,
+        endingType,   // [BugA-solo] 終止タイプを転送
+        phraseLens,   // [BugA-solo] 可変フレーズ長を転送
+        arrangeStyle, // [Lyrical] アレンジスタイルを転送
+      });
+
+  // [chord_only] コードのみモード:
+  //   描画用イベントではメロディを空にするが、buildInnerVoices には
+  //   melodyTrack を渡して usedStrings の判定に使わせる（メロディ音程を加味したコード配置）。
+  //   実際の描画では applyDifficultyFilter / preFilter で melody が除去される。
+  const effectiveMelodyTrack = melodyTrack;
+
+  // [Lyrical] Step 1.5: tieOut フラグが付いた小節末尾音の後続先頭音に tieIn を付与
+  // 「前小節のメロディが同弦・同フレットで次小節冒頭まで伸びる」シンコペを実現する
+  if (isLyrical) {
+    const melodyByMeasure = chordNames.map((_, mi) =>
+      melodyTrack.filter(e => e.voice === 'melody' && e._measureIdx === mi)
+                 .sort((a, b) => a.beat - b.beat)
+    );
+    let consecutiveTieCount = 0; // 乱用防止カウンタ（フレーズ内2連続まで）
+    melodyByMeasure.forEach((mEvents, mi) => {
+      if (mEvents.length === 0) return;
+      const lastEv = mEvents[mEvents.length - 1];
+      const nextEvents = melodyByMeasure[mi + 1];
+      if (!nextEvents || nextEvents.length === 0) return;
+      const firstEv = nextEvents[0];
+      if (lastEv.tieOut) {
+        // 同音（同MIDI）の場合のみ実際のタイとして結ぶ
+        if (lastEv.midi === firstEv.midi) {
+          firstEv.tieIn = true;
+          consecutiveTieCount++;
+        } else {
+          // 音が変わる場合はtieOutを解除（シンコペ候補から外す）
+          lastEv.tieOut = false;
+          consecutiveTieCount = 0;
+        }
+      } else {
+        consecutiveTieCount = 0;
+      }
+      // 同フレーズ内3回以上連続したらtieOutをリセット
+      if (consecutiveTieCount >= 3) {
+        lastEv.tieOut = false;
+        firstEv.tieIn = false;
+        consecutiveTieCount = 0;
+      }
+    });
+  }
+
+  // Step 2-A: 各小節の代表メロディ音から voicing を選択
+  // [P2-7] prevFrets を渡して移動コスト最小のボイシングを選ぶ
+  const chordFretsArray = [];
+  chordNames.forEach((chord, mi) => {
+    const melInMeasure = melodyTrack.filter(e => e._measureIdx === mi);
+    const melodyMidi   = melInMeasure[0]?.midi ?? 69;
+    const prevFrets    = mi > 0 ? chordFretsArray[mi - 1] : null;
+    chordFretsArray.push(selectVoicing(chord, melodyMidi, difficulty, key, prevFrets, arrangeStyle).frets);
+  });
+
+  // [D2] directMode: JSON に bass/inner が含まれているため自動生成をスキップ
+  //      effectiveMelodyTrack には melody/bass/inner が全て入っている
+  let bassTrack, innerTrack;
+  if (_directMode) {
+    bassTrack  = [];  // 自動生成しない（JSON由来のbassがexternalMelodyに含まれる）
+    innerTrack = [];  // 自動生成しない（JSON由来のinnerがexternalMelodyに含まれる）
+  } else {
+    // Step 2-B: ベースライン
+    const voicingCFrets = chordFretsArray.map(frets => frets[1]);
+    bassTrack  = buildBassLine(chordNames, key, effectiveMelodyTrack, difficulty, voicingCFrets, genre, arrangeStyle);
+    // Step 2-C: 内声（[Mid-2] 密度動的化済み）
+    innerTrack = buildInnerVoices(effectiveMelodyTrack, bassTrack, chordFretsArray, difficulty, _chordOnly, _thumbPicking);
+  }
+
+  // [Mid-1] ポジション・ブロック: メロディを4フレット幅内に正規化
+  // low難易度・skipフラグ・directMode 時はスキップ
+  const blockedMelody = (difficulty !== 'low' && !_skipPositionBlock && !_directMode)
+    ? _applyPositionBlock(effectiveMelodyTrack, bassTrack, chordNames.length, options)
+    : effectiveMelodyTrack;
+
+  // [Mid-3] A弦フレーズ終止: root/stableの最終音をA弦優先に
+  // directMode時はスキップ（JSONの弦割り当てを保護）
+  const cadencedMelody = (!_directMode)
+    ? _applyAStringCadence(blockedMelody, bassTrack, chordNames.length)
+    : blockedMelody;
+
+  // [melody_only] メロディのみモード: bass/innerを破棄してmelodyTrackだけ返す
+  // [chord_only]  コードのみモード:  melodyはusedStrings判定には使ったが描画には出さない
+  //                                  → bass/innerのみ preFilter に含める
+  // [directMode]  JSON全声部をそのまま使う（cadencedMelodyにbass/innerも含まれる）
+  const preFilter = _melodyOnly
+    ? cadencedMelody
+    : _directMode
+      ? cadencedMelody
+      : _chordOnly
+        ? [...bassTrack, ...innerTrack]   // melody は除外（コードのみ表示）
+        : [...cadencedMelody, ...bassTrack, ...innerTrack];
+
+  // Step 3: 統合 → 競合解消 → 奏法付与 → 間引き
+  const merged   = preFilter;
+  const resolved = resolveStringConflicts(merged);
+  // [Lyrical] 叙情モードではarpeggioの比率を上げる
+  const withTech = applyGenreTechniques(resolved, genre, difficulty, arrangeStyle, _directMode);
+  // [D2] directMode: 難易度フィルタをかけず全声部をそのまま通す
+  const filtered = (_directMode)
+    ? withTech
+    : applyDifficultyFilter(withTech, difficulty, _chordOnly, _thumbPicking);
+
+  // SoloScore組み立て
+  const measures = chordNames.map((chord, mi) => ({
+    number:      mi + 1,
+    chord,
+    key,
+    beatsPerBar: 4,
+    chordFrets:  chordFretsArray[mi],
+    // 各小節のイベントだけを持たせる
+    events: filtered.filter(e => e._measureIdx === mi),
+  }));
+
+  // [B-4a] ブルース ターンアラウンド
+  // genre='blues' かつ 8小節以上のとき、最後の4小節を V7-IV7-I7-V7 に差し替える
+  if (genre === 'blues' && measures.length >= 8) {
+    const keyDef = KEY_DEFS.find(d => d.key === key);
+    const ki  = keyDef ? keyDef.idx : 0;
+    const I7  = toEnChordName(CHROMATIC[ki % 12],       '7', key);
+    const IV7 = toEnChordName(CHROMATIC[(ki + 5) % 12], '7', key);
+    const V7  = toEnChordName(CHROMATIC[(ki + 7) % 12], '7', key);
+    const turnaround = [V7, IV7, I7, V7];
+    const startIdx = measures.length - 4;
+    turnaround.forEach((chord, ti) => {
+      const mi = startIdx + ti;
+      const m  = measures[mi];
+      if (!m) return;
+      m.chord = chord;
+      // ベース音差し替え（melody/innerは維持）
+      const struct = getChordStructure(chord);
+      if (struct) {
+        const bf = _findFretForPc(1, struct.rootPc,
+          MELODY_CONSTRAINTS[difficulty]?.maxFret ?? 7) ?? 0;
+        m.events = m.events.map(ev =>
+          ev.voice === 'bass'
+            ? { ...ev, fret: bf, midi: fretToMidi(1, bf) }
+            : ev
+        );
+      }
+    });
+  }
+
+  return {
+    key,
+    tempo:         preset?.tempo ?? 100,
+    timeSignature: [4, 4],
+    genre,
+    difficulty,
+    arrangeStyle,  // [Lyrical] スコアメタデータにも保持
+    scaleMode:     scaleMode ?? preset?.scaleMode ?? 'major',
+    measures,
+    metadata: {
+      title:       '',
+      generatedAt: new Date().toISOString().slice(0, 10),
+    },
+  };
+}
+
+// ---------------------------------------------------------------
+// テスト
+// ---------------------------------------------------------------
+
+function runSoloEngineTests() {
+  console.group('=== SoloEngine v2 Tests ===');
+  let passed = 0, failed = 0;
+
+  function assertOk(label, cond) {
+    if (cond) { console.log(`  ✅ ${label}`); passed++; }
+    else       { console.warn(`  ❌ ${label}`); failed++; }
+  }
+  function assert(label, actual, expected) {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    if (ok) console.log(`  ✅ ${label}`);
+    else { console.warn(`  ❌ ${label}  actual=${JSON.stringify(actual)}`); failed++; }
+    if (ok) passed++;
+  }
+
+  // [B2] 各小節に正しくイベントが割り当てられるか（ballad/mixed含む）
+  console.group('[B2] 全リズムで全小節にイベントが入るか');
+  ['eighth','quarter','ballad','mixed','dotted','swing'].forEach(r => {
+    const score = buildSoloScore(['C','Am','F','G'],'C',{rhythm:r, difficulty:'mid'});
+    const allHave = score.measures.every(m => m.events.some(e => e.voice === 'melody'));
+    assertOk(`rhythm=${r}: 全小節にmelodyあり`, allHave);
+  });
+  console.groupEnd();
+
+  // [B1] 全小節にbassが割り当てられるか
+  console.group('[B1] 全小節にbassイベントが入るか');
+  const sc = buildSoloScore(['C','Am','F','G'],'C',{difficulty:'mid'});
+  sc.measures.forEach((m,i) => {
+    assertOk(`小節${i+1} bassあり`, m.events.some(e => e.voice === 'bass'));
+  });
+  console.groupEnd();
+
+  // [N1] playStyleが付与されているか
+  console.group('[N1] playStyle付与');
+  const sb = buildSoloScore(['C','Am'],'C',{genre:'bossa', difficulty:'mid'});
+  const bassEv = sb.measures[0].events.find(e => e.voice === 'bass');
+  assertOk('bossa bassのplayStyle=thumb', bassEv?.playStyle === 'thumb');
+  console.groupEnd();
+
+  // 初級: メロディとベースのみ
+  console.group('初級: melody+bassのみ');
+  const sl = buildSoloScore(['C','F','G','C'],'C',{difficulty:'low'});
+  assertOk('innerなし', sl.measures.every(m => !m.events.some(e=>e.voice==='inner')));
+  sl.measures.forEach((m,i) => {
+    assertOk(`初級 小節${i+1} melodyあり`, m.events.some(e=>e.voice==='melody'));
+    assertOk(`初級 小節${i+1} bassあり`,   m.events.some(e=>e.voice==='bass'));
+  });
+  console.groupEnd();
+
+  // 全曲調×全難易度でエラーなし
+  console.group('全21通りエラーなし');
+  let errCount = 0;
+  [null,'pop','ballad','jazz','bossa','folk','rock','syncopated'].forEach(g => {
+    ['low','mid','high'].forEach(d => {
+      try {
+        const s = buildSoloScore(['C','Am','F','G'],'C',{genre:g,difficulty:d});
+        if (!s?.measures?.length) errCount++;
+      } catch(e) { errCount++; console.warn(g,d,e.message); }
+    });
+  });
+  assertOk('全21通りエラーなし', errCount === 0);
+  console.groupEnd();
+
+  console.log(`\n結果: ${passed}件 ✅  ${failed}件 ❌`);
+  console.groupEnd();
+  return { passed, failed };
+}
+</script>

@@ -1,0 +1,225 @@
+<script>
+// ===================================================================
+// js_midiParser.txt  ― ブラウザ用 MIDI Type0/1 バイナリパーサ
+//
+// 依存: なし（単体で動作）
+// 出力: parseMidi(arrayBuffer) → MidiData オブジェクト
+//
+// MidiData 構造:
+// {
+//   format:     0|1|2,
+//   ticksPerBeat: number,
+//   tempo:      number,   // μs/beat（最初のテンポイベントから）
+//   tracks: [
+//     [
+//       { tick:number, type:string, ...payload }
+//     ]
+//   ]
+// }
+//
+// 対応イベント:
+//   noteOn / noteOff / setTempo / timeSignature / keySignature
+//   programChange / controlChange / endOfTrack / text / marker
+// ===================================================================
+
+/**
+ * ArrayBuffer を MIDI データに解析する
+ * @param {ArrayBuffer} buf
+ * @returns {MidiData}
+ */
+function parseMidi(buf) {
+  const view   = new DataView(buf);
+  let   offset = 0;
+
+  // ── ヘルパー ──────────────────────────────────────────────────
+  function readUint8()  { return view.getUint8(offset++); }
+  function readUint16() { const v = view.getUint16(offset); offset += 2; return v; }
+  function readUint32() { const v = view.getUint32(offset); offset += 4; return v; }
+  function readBytes(n) {
+    const b = new Uint8Array(buf, offset, n);
+    offset += n;
+    return b;
+  }
+  function readString(n) {
+    return Array.from(readBytes(n)).map(c => String.fromCharCode(c)).join('');
+  }
+  // 可変長整数（Variable Length Quantity）
+  function readVLQ() {
+    let val = 0;
+    for (let i = 0; i < 4; i++) {
+      const b = readUint8();
+      val = (val << 7) | (b & 0x7F);
+      if (!(b & 0x80)) break;
+    }
+    return val;
+  }
+
+  // ── ヘッダチャンク ──────────────────────────────────────────
+  const headerMark = readString(4);
+  if (headerMark !== 'MThd') throw new Error('MIDIヘッダが見つかりません（MThd）');
+  const headerLen    = readUint32(); // 常に6
+  if (headerLen !== 6) offset += headerLen - 6; // 念のため
+  const format       = readUint16();
+  const numTracks    = readUint16();
+  const timeDivision = readUint16();
+
+  // timeDivision: bit15=0 → PPQ, =1 → SMPTE（今回はPPQのみ対応）
+  if (timeDivision & 0x8000) {
+    throw new Error('SMPTEタイムコードは非対応です（PPQのみ対応）');
+  }
+  const ticksPerBeat = timeDivision;
+
+  // ── トラックチャンク ─────────────────────────────────────────
+  const tracks = [];
+  let   defaultTempo = 500000; // 120 BPM
+
+  for (let ti = 0; ti < numTracks; ti++) {
+    const trackMark = readString(4);
+    if (trackMark !== 'MTrk') {
+      // 未知のチャンクはスキップ
+      const skipLen = readUint32();
+      offset += skipLen;
+      continue;
+    }
+    const trackLen   = readUint32();
+    const trackEnd   = offset + trackLen;
+    const events     = [];
+    let   tick       = 0;
+    let   runStatus  = 0; // ランニングステータス
+
+    while (offset < trackEnd) {
+      const delta = readVLQ();
+      tick += delta;
+
+      let statusByte = view.getUint8(offset);
+
+      // ランニングステータス: ステータスバイトが省略されている場合
+      if (statusByte & 0x80) {
+        runStatus  = statusByte;
+        offset++;
+      } else {
+        statusByte = runStatus;
+        // offset は進めない（データバイトとして読む）
+      }
+
+      const type    = (statusByte >> 4) & 0xF;
+      const channel = statusByte & 0xF;
+
+      // ── Meta イベント ──
+      if (statusByte === 0xFF) {
+        const metaType = readUint8();
+        const metaLen  = readVLQ();
+        const metaData = readBytes(metaLen);
+
+        switch (metaType) {
+          case 0x51: { // Set Tempo
+            const tempo = (metaData[0] << 16) | (metaData[1] << 8) | metaData[2];
+            if (ti === 0 && events.filter(e => e.type === 'setTempo').length === 0) {
+              defaultTempo = tempo;
+            }
+            events.push({ tick, type: 'setTempo', tempo });
+            break;
+          }
+          case 0x58: { // Time Signature
+            events.push({
+              tick,
+              type:        'timeSignature',
+              numerator:   metaData[0],
+              denominator: Math.pow(2, metaData[1]),
+            });
+            break;
+          }
+          case 0x59: { // Key Signature
+            const sf   = metaData[0] > 127 ? metaData[0] - 256 : metaData[0]; // signed
+            const mode = metaData[1]; // 0=major, 1=minor
+            events.push({ tick, type: 'keySignature', sharpsFlats: sf, mode });
+            break;
+          }
+          case 0x2F: // End of Track
+            events.push({ tick, type: 'endOfTrack' });
+            break;
+          case 0x01: case 0x03: case 0x06: { // Text, Track Name, Marker
+            const label = Array.from(metaData).map(c => String.fromCharCode(c)).join('');
+            events.push({ tick, type: metaType === 0x06 ? 'marker' : 'text', text: label });
+            break;
+          }
+          default:
+            // 未知のMetaはスキップ済み
+            break;
+        }
+        runStatus = 0; // MetaイベントはRunning Statusをリセット
+        continue;
+      }
+
+      // ── SysEx ──
+      if (statusByte === 0xF0 || statusByte === 0xF7) {
+        const sysexLen = readVLQ();
+        offset += sysexLen;
+        runStatus = 0;
+        continue;
+      }
+
+      // ── MIDIチャンネルイベント ──
+      switch (type) {
+        case 0x9: { // Note On
+          const note     = readUint8();
+          const velocity = readUint8();
+          // velocity=0 はNote Offとして扱う
+          events.push({
+            tick,
+            type:     velocity === 0 ? 'noteOff' : 'noteOn',
+            channel,
+            note,
+            velocity,
+          });
+          break;
+        }
+        case 0x8: { // Note Off
+          const note     = readUint8();
+          const velocity = readUint8();
+          events.push({ tick, type: 'noteOff', channel, note, velocity });
+          break;
+        }
+        case 0xA: { // Aftertouch
+          offset += 2; // スキップ
+          break;
+        }
+        case 0xB: { // Control Change
+          const cc  = readUint8();
+          const val = readUint8();
+          events.push({ tick, type: 'controlChange', channel, controller: cc, value: val });
+          break;
+        }
+        case 0xC: { // Program Change
+          const program = readUint8();
+          events.push({ tick, type: 'programChange', channel, program });
+          break;
+        }
+        case 0xD: { // Channel Pressure
+          offset += 1;
+          break;
+        }
+        case 0xE: { // Pitch Bend
+          offset += 2;
+          break;
+        }
+        default:
+          // 未知のステータスはスキップ（1バイト進める）
+          offset++;
+          break;
+      }
+    }
+
+    // trackEnd に合わせる（パース誤差を吸収）
+    offset = trackEnd;
+    tracks.push(events);
+  }
+
+  return {
+    format,
+    ticksPerBeat,
+    tempo: defaultTempo,
+    tracks,
+  };
+}
+</script>

@@ -1,0 +1,836 @@
+<script>
+// ===================================================================
+// solo_js_drawing.txt  ― ソロウクレレ タブ譜SVG描画 v2
+//
+// バグ修正:
+//   [B3] 初級で弦が消える → 常に4弦(G/C/E/A)全表示に変更
+//        音符がない弦は線だけ表示（番号なし）
+//   [B4] 音符記号と音符の位置ずれ →
+//        beatToX() を一本化して全要素で同じX計算を使う
+//
+// 新機能:
+//   [N1] ストローク/ピッキング/親指 の奏法アイコン表示
+//        音符の左下または右下に小さなアイコンを描画
+//        picking: 指マーク(p̈)  strum: 矢印(↓↑)  thumb: ○T  arpeggio: 波線
+// ===================================================================
+
+// ---------------------------------------------------------------
+// 描画定数
+// ---------------------------------------------------------------
+
+const SOLO_LAYOUT = {
+  MT:       40,   // 上マージン（コード名 + 音符記号行）
+  CHORD_H:  18,   // コード名行高
+  RHYTHM_H: 16,   // 音符記号行の高さ
+  STR_SS:   28,   // 弦間隔（4弦固定）
+  MB:       20,   // 下マージン（奏法アイコン行）
+  // 4弦固定なので総高さ = MT + CHORD_H + RHYTHM_H + 4*STR_SS + MB
+};
+
+// 常に4弦全表示（音符がない弦も線だけ表示）
+// 描画順: 上からA(si=3), E(si=2), C(si=1), G(si=0)
+const ALL_STRINGS = [3, 2, 1, 0]; // si順（表示順）
+const STR_NAME    = { 0:'G', 1:'C', 2:'E', 3:'A' };
+
+const SOLO_NOTE_STYLE = {
+  melody:     { r: 11 },
+  bass:       { r: 10 },
+  bass_melody:{ r: 11 },
+  inner:      { r:  8 },
+};
+
+const SOLO_ROLE_COLORS = {
+  root:      '#1D9E75',
+  stable:    '#378ADD',
+  color:     '#7F77DD',
+  tension:   '#D85A30',
+  passing:   '#888780',
+  chromatic: '#BA7517',
+};
+
+const TECHNIQUE_MARK = {
+  hammer_on: 'h',
+  pull_off:  'p',
+  slide:     '/',
+  mute:      'x',  // [A3] カッティング
+};
+
+const DIFFICULTY_LABELS = {
+  low:  '★☆☆ 初級',
+  mid:  '★★☆ 中級',
+  high: '★★★ 上級',
+};
+
+function _durationSymbol(dur) {
+  // [Lyrical] 3拍・4拍は叙情モードで多用されるため視覚的に差をつける
+  // Musical Symbols(U+1D100台)はiOS等で未対応のため使用しない
+  if (dur >= 4)    return '♩♩♩♩'; // 全音符: 四分×4で代替
+  if (dur >= 3)    return '♩♩.';   // 付点2分: 四分×2+付点で代替
+  if (dur >= 2)    return '♩♩';    // 二分音符: 四分×2で代替 (U+2669)
+  if (dur >= 1.5)  return '♩. ';   // 付点四分音符 (U+2669 + .)
+  if (dur >= 1)    return '♩';     // 四分音符 (U+2669)
+  if (dur >= 0.75) return '♪. ';   // 付点八分音符 (U+266A + .)
+  if (dur >= 0.5)  return '♪';     // 八分音符 (U+266A)
+  return '♬';                      // 十六分音符代替: 連桁付き八分音符 (U+266C)
+}
+
+
+// 現在の描画で使用する音符半径（drawSoloTabが設定、_analyzeOverlapsが参照）
+let NOTE_R_CURRENT     = 8;
+let NOTE_R_INN_CURRENT = 6;
+
+
+// ---------------------------------------------------------------
+// 重なり対応ユーティリティ
+// ---------------------------------------------------------------
+
+/**
+ * _analyzeOverlaps
+ * 小節内の全イベントについて「同弦で隣接するX距離」を計算し、
+ * 重なりが発生するイベントに補正情報を付与して返す。
+ *
+ * @param {SoloEvent[]} events  小節の全イベント
+ * @param {number}      cx0     小節左端X
+ * @param {number}      CW      小節幅
+ * @returns {Map}  ev → { r, yOffset, inOverlapGroup }
+ */
+function _analyzeOverlaps(events, cx0, CW) {
+  const result = new Map();
+
+  // 弦ごとにイベントを分離してX距離を計算
+  const byString = {};
+  events.forEach(ev => {
+    const si = ev.stringIdx;
+    if (si == null) return;
+    if (!byString[si]) byString[si] = [];
+    byString[si].push(ev);
+  });
+
+  Object.values(byString).forEach(evList => {
+    // beat順にソート
+    evList.sort((a, b) => a.beat - b.beat);
+
+    for (let i = 0; i < evList.length; i++) {
+      const ev  = evList[i];
+      const baseR = ev.voice === 'melody'     ? NOTE_R_CURRENT
+                  : ev.voice === 'bass'       ? NOTE_R_CURRENT
+                  : NOTE_R_INN_CURRENT;
+
+      if (!result.has(ev)) {
+        result.set(ev, { r: baseR, yOffset: 0, inOverlapGroup: false });
+      }
+    }
+
+    for (let i = 0; i < evList.length - 1; i++) {
+      const evA = evList[i];
+      const evB = evList[i + 1];
+      const xA  = _beatToX(evA.beat, cx0, CW);
+      const xB  = _beatToX(evB.beat, cx0, CW);
+      const dist = xB - xA;
+
+      const infoA = result.get(evA);
+      const infoB = result.get(evB);
+
+      const rA = infoA.r;
+      const rB = infoB.r;
+      const minDist = rA + rB; // 重なりなし最低距離
+
+      if (dist < minDist) {
+        // 重なり発生
+        // r を縮小: dist/2 が新半径の上限（最小5px）
+        const newR = Math.max(5, Math.floor(dist / 2) - 1);
+        infoA.r = Math.min(infoA.r, newR);
+        infoB.r = Math.min(infoB.r, newR);
+
+        // Y方向千鳥: 重なり量の半分 + 余白でオフセット
+        const overlap = minDist - dist;
+        const offset  = Math.ceil(overlap / 2) + 2;
+        if (infoA.yOffset === 0) infoA.yOffset = -offset;
+        if (infoB.yOffset === 0) infoB.yOffset = +offset;
+
+        // 重なりグループフラグ
+        infoA.inOverlapGroup = true;
+        infoB.inOverlapGroup = true;
+      }
+    }
+  });
+
+  return result;
+}
+
+/**
+ * _drawSoloNoteSymbolOverlap
+ * 重なり補正情報を考慮した音符描画
+ *
+ * @param {SoloEvent} ev
+ * @param {number}    cx     X座標
+ * @param {number}    cy     弦のY座標（オフセット前）
+ * @param {number}    r      補正後半径
+ * @param {number}    yOffset  Y方向オフセット（千鳥配置）
+ * @param {Object}    clr
+ * @returns {string}
+ */
+function _drawSoloNoteSymbolOverlap(ev, cx, cy, r, yOffset, clr) {
+  const actualY = cy + yOffset;
+  // 半径に応じてフォントサイズを縮小（r=5→6px, r=6→7px, r>=7→9px）
+  // 最小6pxでも1桁なら円内で判読可能
+  const fs = r <= 5 ? 6 : r === 6 ? 7 : 9;
+
+  let fill, stroke, sw, textColor;
+
+  if (ev.voice === 'melody' || ev.voice === 'bass_melody') {
+    fill      = SOLO_ROLE_COLORS[ev.role] ?? '#888780';
+    stroke    = 'none'; sw = 0;
+    textColor = '#fff';
+    if (ev.duration >= 2) {
+      stroke = fill; fill = clr.bg; sw = 1.5;
+      textColor = stroke;
+    }
+  } else if (ev.voice === 'bass') {
+    fill      = ev.fret === 0 ? clr.bg : '#1D9E75';
+    stroke    = '#1D9E75';
+    sw        = ev.fret === 0 ? 1.5 : 0;
+    textColor = ev.fret === 0 ? '#1D9E75' : '#fff';
+  } else {
+    // inner: 角丸四角（視認性改善: 薄グレー背景・濃グレー枠・テキストカラー文字）
+    const hw = Math.max(3, r - 1);
+    const innerFill   = 'rgba(136,135,128,0.18)';
+    const innerStroke = 'rgba(80,79,73,0.85)';
+    const innerText   = clr.text ?? '#3a3a3a';
+    return (
+      `<rect x="${cx - hw}" y="${actualY - hw}" width="${hw*2}" height="${hw*2}"
+           rx="2" fill="${innerFill}" stroke="${innerStroke}" stroke-width="1.2"/>` +
+      `<text x="${cx}" y="${actualY + 0.5}" text-anchor="middle"
+           dominant-baseline="central" font-size="${fs}" font-weight="700"
+           fill="${innerText}" font-family="'DM Mono',monospace">${ev.fret ?? 0}</text>`
+    );
+  }
+
+  const r_actual = Math.max(5, Math.round(r * (ev.emphasis ?? 1.0)));
+  const strokeAttr = sw > 0 ? `stroke="${stroke}" stroke-width="${sw}"` : '';
+  let out = `<circle cx="${cx}" cy="${actualY}" r="${r_actual}" fill="${fill}" ${strokeAttr}/>`;
+  // 常に円内にフレット番号（フォント縮小で対応）
+  out += `<text x="${cx}" y="${actualY + 0.5}" text-anchor="middle"
+               dominant-baseline="central" font-size="${fs}" font-weight="700"
+               fill="${textColor}" font-family="'DM Mono',monospace">${ev.fret ?? 0}</text>`;
+  return out;
+}
+
+// ---------------------------------------------------------------
+// [B4] 統一X座標計算
+// ---------------------------------------------------------------
+
+/**
+ * beat(1〜beatsPerBar)を小節内X座標に変換する
+ * 音符記号・音符・符尾・奏法記号すべてこの関数を使う
+ *
+ * @param {number} beat   拍位置（1始まり）
+ * @param {number} cx0    小節の左端X
+ * @param {number} CW     小節幅
+ * @param {number} bpb    拍子分子（デフォルト4）
+ * @returns {number}
+ */
+function _beatToX(beat, cx0, CW, bpb = 4) {
+  // beat=1が CW*0.1 の位置、beat=bpb+1 が CW*0.9（右余白）になるよう線形マップ
+  const margin = CW * 0.08;
+  return cx0 + margin + ((beat - 1) / bpb) * (CW - margin * 2);
+}
+
+/**
+ * [D4] 小節内の最高音符密度（最小beat間隔）を計算し、
+ * 推奨する行あたり小節数を返す。
+ *
+ * 16分音符(duration=0.25)が多い小節は、標準の4小節/行では
+ * 音符が重なってつぶれるため、1〜2小節/行に自動縮小する。
+ *
+ * @param {object[]} measures  SoloScore.measures 配列
+ * @param {number}   baseMPR   基準となる行あたり小節数（高難度=3, それ以外=4）
+ * @returns {number}  実際に使う行あたり小節数
+ */
+function _calcAdaptiveMPR(measures, baseMPR) {
+  if (!measures || measures.length === 0) return baseMPR;
+
+  // 全小節の最大音符数を求める
+  const maxNotes = Math.max(...measures.map(m => m.events ? m.events.length : 0));
+
+  // 1小節あたり16音以上 → 1小節/行（非常に密）
+  if (maxNotes >= 16) return 1;
+  // 1小節あたり12音以上 → 2小節/行
+  if (maxNotes >= 12) return Math.min(baseMPR, 2);
+  // 1小節あたり8音以上 → 3小節/行（highと同様）
+  if (maxNotes >= 8)  return Math.min(baseMPR, 3);
+
+  return baseMPR;
+}
+
+// ---------------------------------------------------------------
+// メイン描画関数: drawSoloTab
+// ---------------------------------------------------------------
+
+
+// ---------------------------------------------------------------
+// メイン描画関数: drawSoloTab
+// 複数行レイアウト対応版 (v3 改)
+//
+// 設計:
+//   - 1行に MEASURES_PER_ROW 小節を並べる（デフォルト4）
+//   - 小節幅 CW = (W - ML - MR) / MEASURES_PER_ROW で固定
+//   - 8分音符8個の間隔が音符直径を超えるよう CW を確保
+//   - 行間に ROW_GAP px の余白
+// ---------------------------------------------------------------
+
+function drawSoloTab(svgId, score, focusIdx = -1) {
+  const svg = document.getElementById(svgId);
+  if (!svg || !score) return;
+
+  const clr  = getThemeColors('melody');
+  const diff = score.difficulty ?? 'mid';
+
+  // ── レイアウト定数 ──
+  const W   = 680;
+  const ML  = 48;   // 左マージン（弦ラベル）
+  const MR  = 12;   // 右マージン
+  const { CHORD_H, RHYTHM_H, STR_SS, MB } = SOLO_LAYOUT;
+  const MT_FIRST = 36; // 最初の行の上マージン（ラベル表示分）
+  const ROW_GAP  = 20; // 行間の隙間
+
+  // 難易度に応じた行あたり小節数・音符サイズを決定
+  // high: 内声+メロディ+ベースで密になるため3小節/行
+  const BASE_MPR   = diff === 'high' ? 3 : 4; // measures per row（基準）
+  // [D4] 音符密度に応じて行あたり小節数を自動調整（16分音符対応）
+  const MPR        = _calcAdaptiveMPR(score.measures, BASE_MPR);
+  const NOTE_R_MEL = diff === 'high' ? 9 : MPR <= 2 ? 10 : 8; // メロディ音符半径（密なら縮小）
+  const NOTE_R_BAS = 8;                                         // ベース音符半径
+  const NOTE_R_INN = MPR <= 2 ? 5 : 6;                         // 内声音符半径
+  // _analyzeOverlaps から参照できるようモジュール変数に反映
+  NOTE_R_CURRENT     = NOTE_R_MEL;
+  NOTE_R_INN_CURRENT = NOTE_R_INN;
+
+  // 1行の高さ（コード名行 + 音符記号行 + 弦4本 + 下マージン）
+  const ROW_CONTENT_H = CHORD_H + RHYTHM_H + 4 * STR_SS;
+  const ROW_H         = ROW_CONTENT_H + MB;
+
+  const chordCount = score.measures.length;
+  const numRows    = Math.ceil(chordCount / MPR);
+
+  // SVG全体サイズ
+  const svgW = W;
+  const svgH = MT_FIRST + numRows * ROW_H + (numRows - 1) * ROW_GAP;
+
+  svg.setAttribute('viewBox', `0 0 ${svgW} ${svgH}`);
+
+  // 1行の小節幅（固定）
+  const CW = (W - ML - MR) / MPR;
+
+  let h = '';
+
+  // ── 背景 ──
+  h += `<rect x="0" y="0" width="${svgW}" height="${svgH}" fill="transparent"/>`;
+
+  // ── グローバルラベル（1行目上部）──
+  const tempo        = score.tempo && score.tempo !== 100 ? `♩=${score.tempo}  ` : '';
+  const genreLabel   = score.genre ? (GENRE_PRESETS[score.genre]?.label ?? '') : '';
+  const diffLabel    = DIFFICULTY_LABELS[diff] ?? '';
+  // [Lyrical] 叙情モードのバッジ
+  const lyricalBadge = score.arrangeStyle === 'lyrical'
+    ? `  🌙 叙情` : '';
+  // [Import] 演奏モードバッジ
+  const playModeBadge = score.playMode === 'faithful'
+    ? `  📜 原曲重視` : (score.playMode === 'ukulele' ? `  🎸 UK最適化` : '');
+  h += `<text x="${ML}" y="14" font-size="10" fill="${clr.text2}"
+             font-family="'Noto Sans JP',sans-serif"
+             >${tempo}${genreLabel}　${diffLabel}${lyricalBadge}${playModeBadge}</text>`;
+
+  // ── Y座標ヘルパー（行ローカル）──
+  // rowY = 行の上端Y座標
+  const yStrInRow = (si, rowY) => {
+    const row = ALL_STRINGS.indexOf(si);
+    return rowY + CHORD_H + RHYTHM_H + row * STR_SS + STR_SS / 2;
+  };
+  const yChordInRow  = (rowY) => rowY + CHORD_H - 4;
+  const yRhythmInRow = (rowY) => rowY + CHORD_H + RHYTHM_H / 2;
+  const yStrTopInRow = (rowY) => rowY + CHORD_H + RHYTHM_H;
+  const yStrBotInRow = (rowY) => rowY + CHORD_H + RHYTHM_H + 4 * STR_SS;
+
+  // ── 行ごとに描画 ──
+  for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
+    const rowY     = MT_FIRST + rowIdx * (ROW_H + ROW_GAP);
+    const rowStart = rowIdx * MPR;
+    const rowEnd   = Math.min(rowStart + MPR, chordCount);
+    const rowMeasures = score.measures.slice(rowStart, rowEnd);
+    const rowCount = rowMeasures.length;
+
+    const yStrTop = yStrTopInRow(rowY);
+    const yStrBot = yStrBotInRow(rowY);
+    const yTechRow = yStrBot + 10;
+
+    // 弦ラベル（行ごとに左端に表示）
+    ALL_STRINGS.forEach(si => {
+      h += `<text x="${ML - 8}" y="${yStrInRow(si, rowY) + 1}"
+                 text-anchor="end" dominant-baseline="central"
+                 font-size="9" fill="${clr.text2}"
+                 font-family="'DM Mono',monospace">${STR_NAME[si]}</text>`;
+    });
+
+    // 弦の横線（この行の全幅）
+    ALL_STRINGS.forEach((si, row) => {
+      const y  = yStrInRow(si, rowY);
+      const sw = 0.5 + row * 0.1;
+      const lineEnd = ML + rowCount * CW;
+      h += `<line x1="${ML}" y1="${y}" x2="${lineEnd}" y2="${y}"
+                 stroke="${clr.string}" stroke-width="${sw}"/>`;
+    });
+
+    // 小節区切り縦線
+    for (let ci = 0; ci <= rowCount; ci++) {
+      const x  = ML + ci * CW;
+      const sw = ci === 0 || ci === rowCount ? 1.8 : 0.8;
+      h += `<line x1="${x}" y1="${yStrTop}" x2="${x}" y2="${yStrBot}"
+                 stroke="${clr.border}" stroke-width="${sw}"/>`;
+    }
+
+    // ── 各小節の描画 ──
+    rowMeasures.forEach((m, localCi) => {
+      const globalCi = rowStart + localCi;
+      const cx0      = ML + localCi * CW;
+      const isActive = globalCi === focusIdx;
+
+      // フォーカスハイライト
+      if (isActive) {
+        h += `<rect x="${cx0 + 1}" y="${yStrTop}"
+                    width="${CW - 2}" height="${yStrBot - yStrTop}"
+                    rx="3" fill="${clr.focus}"/>`;
+      }
+
+      // 小節クリックでシーク（透明なヒット領域）
+      h += `<rect x="${cx0}" y="${yStrTop - 4}" width="${CW}" height="${yStrBot - yStrTop + 18}"
+                  fill="transparent" style="cursor:pointer"
+                  onclick="soloPlayerSeekToMeasure(${globalCi})"
+                  title="${globalCi + 1}小節目から再生"/>`;
+
+      // 小節番号
+      h += `<text x="${cx0 + 3}" y="${yStrBot + 14}"
+                 text-anchor="start" font-size="8" fill="${clr.text2}"
+                 font-family="'DM Mono',monospace">${m.number}</text>`;
+
+      // コード名
+      const cxMid = cx0 + CW / 2;
+      h += `<text x="${cxMid}" y="${yChordInRow(rowY)}"
+                 text-anchor="middle" font-size="13" font-weight="700"
+                 fill="${isActive ? clr.dotRoot : clr.text}"
+                 font-family="'DM Mono',monospace">${m.chord}</text>`;
+
+      // メロディイベント
+      const melEvts = m.events.filter(e => e.voice === 'melody');
+
+      // 音符記号（♩♪）
+      melEvts.forEach(ev => {
+        const bx  = _beatToX(ev.beat, cx0, CW);
+        const sym = _durationSymbol(ev.duration);
+        h += `<text x="${bx}" y="${yRhythmInRow(rowY)}"
+                   text-anchor="middle" dominant-baseline="central"
+                   font-size="10" fill="${clr.text2}"
+                   font-family="'Noto Sans Symbols','Segoe UI Symbol',serif,sans-serif">${sym}</text>`;
+      });
+
+      // 各弦の音符（重なり解析付き）
+      const overlapMap = _analyzeOverlaps(m.events, cx0, CW);
+      m.events.forEach(ev => {
+        const si = ev.stringIdx;
+        if (!ALL_STRINGS.includes(si)) return;
+        const bx = _beatToX(ev.beat, cx0, CW);
+        const y  = yStrInRow(si, rowY);
+        const info = overlapMap.get(ev) ?? { r: NOTE_R_MEL, yOffset: 0 };
+        // 音符本体: 常に円内にフォント縮小で数字描画
+        h += _drawSoloNoteSymbolOverlap(ev, bx, y, info.r, info.yOffset, clr);
+        // 奏法記号: actualY (= y + yOffset) の上に配置
+        if (ev.technique && TECHNIQUE_MARK[ev.technique]) {
+          h += _drawTechMarkR(ev, bx, y + info.yOffset, info.r, clr);
+        }
+      });
+
+      // 重なりグループのアンダーライン（まとまりを視覚化）
+      h += _drawOverlapGroupLines(m.events, overlapMap, cx0, CW, yStrInRow, rowY, clr);
+
+      // 符尾・連桁
+      h += _drawStemAndBeamRow(melEvts, cx0, CW,
+        (si) => yStrInRow(si, rowY), NOTE_R_MEL, clr);
+
+      // タイ描画（同行内の前小節との間）
+      // [Lyrical] tieOut/tieIn フラグを優先。なければ従来のヒューリスティック
+      if (localCi > 0) {
+        const prevM   = rowMeasures[localCi - 1];
+        const prevMel = prevM.events.filter(e => e.voice === 'melody');
+        const lastPrev  = prevMel.length > 0 ? prevMel[prevMel.length - 1] : null;
+        const firstCur  = melEvts.length > 0 ? melEvts[0] : null;
+        if (lastPrev && firstCur) {
+          // 明示 tieOut フラグ OR 従来の同音ヒューリスティック
+          const isTie = lastPrev.tieOut
+            ? (lastPrev.midi === firstCur.midi)
+            : (lastPrev.midi === firstCur.midi && lastPrev.stringIdx === firstCur.stringIdx);
+          if (isTie) {
+            const prevCx0 = ML + (localCi - 1) * CW;
+            const x1 = _beatToX(lastPrev.beat, prevCx0, CW) + 4;
+            const x2 = _beatToX(firstCur.beat, cx0, CW) - 4;
+            const ty  = yStrInRow(lastPrev.stringIdx, rowY) - (NOTE_R_MEL + 3);
+            const col = SOLO_ROLE_COLORS[lastPrev.role] ?? clr.text2;
+            const sw  = lastPrev.tieOut ? 2.0 : 1.5;
+            const op  = lastPrev.tieOut ? 0.85 : 0.6;
+            h += `<path d="M${x1},${ty} Q${(x1+x2)/2},${ty - 8} ${x2},${ty}"
+                       stroke="${col}" stroke-width="${sw}" fill="none" opacity="${op}"/>`;
+          }
+        }
+      }
+
+      // [Lyrical] 行をまたぐタイ描画
+      // 行末の最終小節（localCi === rowCount - 1）にtieOut音符がある場合、
+      // 次行の先頭小節との間をまたぐタイを描画する
+      if (localCi === rowCount - 1) {
+        const lastMelEv = melEvts.length > 0 ? melEvts[melEvts.length - 1] : null;
+        if (lastMelEv?.tieOut) {
+          // 次行の先頭小節を取得
+          const nextRowStart = rowStart + rowCount;
+          const nextMeasure  = score.measures[nextRowStart];
+          const nextMelEvts  = nextMeasure?.events?.filter(e => e.voice === 'melody') ?? [];
+          const firstNext    = nextMelEvts.length > 0 ? nextMelEvts[0] : null;
+          if (firstNext && lastMelEv.midi === firstNext.midi) {
+            const col   = SOLO_ROLE_COLORS[lastMelEv.role] ?? clr.text2;
+            const ty    = yStrInRow(lastMelEv.stringIdx, rowY) - (NOTE_R_MEL + 3);
+            // 行末から右端への短い弧（→ の前半）
+            const x1    = _beatToX(lastMelEv.beat, cx0, CW) + 4;
+            const xEnd  = ML + rowCount * CW - 2;
+            h += `<path d="M${x1},${ty} Q${(x1+xEnd)/2},${ty - 6} ${xEnd},${ty}"
+                         stroke="${col}" stroke-width="2.0" fill="none" opacity="0.85"/>`;
+            // 次行の先頭への短い弧（→ の後半）は次行のrowIdx処理で自動的に localCi===0 で補完される
+            // ただし localCi===0 は prevM を参照しないので、行先頭を明示的に描画する
+            // 次行のY座標を計算
+            if (rowIdx + 1 < numRows) {
+              const nextRowY   = MT_FIRST + (rowIdx + 1) * (ROW_H + ROW_GAP);
+              const nextCx0    = ML; // 次行先頭小節の左端
+              const x2         = _beatToX(firstNext.beat, nextCx0, CW) - 4;
+              const ty2        = yStrInRow(firstNext.stringIdx, nextRowY) - (NOTE_R_MEL + 3);
+              h += `<path d="M${ML},${ty2} Q${(ML+x2)/2},${ty2 - 6} ${x2},${ty2}"
+                           stroke="${col}" stroke-width="2.0" fill="none" opacity="0.85"/>`;
+            }
+          }
+        }
+      }
+
+      // 奏法アイコン
+      h += _drawPlayStyleRow(m.events, cx0, CW, yTechRow, clr);
+    });
+
+    // 行区切り線（最終行以外）
+    if (rowIdx < numRows - 1) {
+      const sepY = yStrBot + ROW_GAP * 0.6;
+      h += `<line x1="${ML}" y1="${sepY}" x2="${W - MR}" y2="${sepY}"
+                 stroke="${clr.border}" stroke-width="0.5" stroke-dasharray="4,4"/>`;
+    }
+  }
+
+  svg.innerHTML = h;
+}
+
+
+// ---------------------------------------------------------------
+// _drawSoloNoteSymbol (後方互換) / _drawSoloNoteSymbolR
+// ---------------------------------------------------------------
+
+// ---------------------------------------------------------------
+// _drawSoloNoteSymbolR: 半径 r を引数で受け取る版
+// ---------------------------------------------------------------
+
+function _drawSoloNoteSymbolR(ev, cx, cy, r, clr) {
+  let fill, stroke, sw, textColor;
+
+  // [A3] カッティング: × マークで表示
+  if (ev.technique === 'mute' || ev.isMute) {
+    const hw = r - 1;
+    const col = 'rgba(136,135,128,0.8)';
+    return (
+      `<line x1="${cx - hw}" y1="${cy - hw}" x2="${cx + hw}" y2="${cy + hw}" stroke="${col}" stroke-width="2.2"/>` +
+      `<line x1="${cx + hw}" y1="${cy - hw}" x2="${cx - hw}" y2="${cy + hw}" stroke="${col}" stroke-width="2.2"/>`
+    );
+  }
+
+  if (ev.voice === 'melody' || ev.voice === 'bass_melody') {
+    fill      = SOLO_ROLE_COLORS[ev.role] ?? '#888780';
+    stroke    = 'none'; sw = 0;
+    textColor = '#fff';
+    if (ev.duration >= 2) {
+      stroke = fill; fill = clr.bg; sw = 2;
+      textColor = stroke;
+    }
+    // [A5] オブリガード: 通常メロディより透明度を下げて区別
+    if (ev.isObbligato) {
+      return (
+        `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill}" stroke="${fill}" stroke-width="1"` +
+        ` opacity="0.45"/>` +
+        `<text x="${cx}" y="${cy + 0.5}" text-anchor="middle" dominant-baseline="central"` +
+        ` font-size="${r > 8 ? 9 : 8}" font-weight="500" fill="${textColor}"` +
+        ` font-family="'DM Mono',monospace" opacity="0.55">${ev.fret ?? 0}</text>`
+      );
+    }
+  } else if (ev.voice === 'bass') {
+    fill      = ev.fret === 0 ? clr.bg : '#1D9E75';
+    stroke    = '#1D9E75';
+    sw        = ev.fret === 0 ? 2 : 0;
+    textColor = ev.fret === 0 ? '#1D9E75' : '#fff';
+  } else {
+    // inner: 角丸四角
+    // [A4] コード弾き（isChordMelody）: ひし形（◇）で区別
+    if (ev.isChordMelody) {
+      const hw = r - 1;
+      const col = 'rgba(55,138,221,0.75)';
+      return (
+        `<polygon points="${cx},${cy - hw} ${cx + hw},${cy} ${cx},${cy + hw} ${cx - hw},${cy}"` +
+        ` fill="${col}" stroke="none"/>` +
+        `<text x="${cx}" y="${cy + 0.5}" text-anchor="middle" dominant-baseline="central"` +
+        ` font-size="7" font-weight="600" fill="#fff"` +
+        ` font-family="'DM Mono',monospace">${ev.fret ?? 0}</text>`
+      );
+    }
+    const hw = r - 1;
+    // 視認性改善: 薄グレー背景・濃グレー枠・テキストカラー文字
+    // フォントサイズはベース（r>8→9px, else 8px）と同等
+    const innerFill   = 'rgba(136,135,128,0.18)';
+    const innerStroke = 'rgba(80,79,73,0.85)';
+    const innerText   = clr.text ?? '#3a3a3a';
+    const innerFs     = r > 8 ? 9 : 8;
+    return (
+      `<rect x="${cx - hw}" y="${cy - hw}" width="${hw*2}" height="${hw*2}"` +
+      ` rx="2" ry="2"` +
+      ` fill="${innerFill}" stroke="${innerStroke}" stroke-width="1.2"/>` +
+      `<text x="${cx}" y="${cy + 0.5}"` +
+      ` text-anchor="middle" dominant-baseline="central"` +
+      ` font-size="${innerFs}" font-weight="700"` +
+      ` fill="${innerText}"` +
+      ` font-family="'DM Mono',monospace">${ev.fret ?? 0}</text>`
+    );
+  }
+
+  const r_actual = Math.round(r * (ev.emphasis ?? 1.0));
+  const strokeAttr = sw > 0 ? `stroke="${stroke}" stroke-width="${sw}"` : '';
+  const fs = r_actual > 8 ? 9 : 8;
+  let out = `<circle cx="${cx}" cy="${cy}" r="${r_actual}" fill="${fill}" ${strokeAttr}/>`;
+  out += `<text x="${cx}" y="${cy + 0.5}"
+               text-anchor="middle" dominant-baseline="central"
+               font-size="${fs}" font-weight="700"
+               fill="${textColor}"
+               font-family="'DM Mono',monospace">${ev.fret ?? 0}</text>`;
+  return out;
+}
+
+// 後方互換: 既存呼び出しをそのまま使えるよう旧関数を残す
+function _drawSoloNoteSymbol(ev, cx, cy, clr) {
+  const r = SOLO_NOTE_STYLE[ev.voice]?.r ?? 8;
+  return _drawSoloNoteSymbolR(ev, cx, cy, r, clr);
+}
+
+
+// ---------------------------------------------------------------
+// _drawTechMarkR: 半径を引数で受け取る版
+// ---------------------------------------------------------------
+
+function _drawTechMarkR(ev, cx, cy, r, clr) {
+  const mark = TECHNIQUE_MARK[ev.technique];
+  if (!mark) return '';
+  return `<text x="${cx}" y="${cy - r - 3}"
+               text-anchor="middle"
+               font-size="9" fill="${clr.text2}"
+               font-family="'DM Mono',monospace">${mark}</text>`;
+}
+
+
+// ---------------------------------------------------------------
+// _drawStemAndBeamRow: 行ローカルy座標・可変半径版
+// ---------------------------------------------------------------
+
+function _drawStemAndBeamRow(melEvts, cx0, CW, yStrFn, noteR, clr) {
+  let out = '';
+  melEvts.forEach((ev, i) => {
+    if (ev.duration >= 2) return;
+    const bx   = _beatToX(ev.beat, cx0, CW);
+    const y    = yStrFn(ev.stringIdx ?? 3);
+    const r    = noteR;
+    const sY1  = y + r;
+    const sY2  = y + r + 10;
+
+    out += `<line x1="${bx}" y1="${sY1}" x2="${bx}" y2="${sY2}"
+                stroke="${clr.text2}" stroke-width="1.5"/>`;
+
+    if (ev.duration <= 0.5) {
+      out += `<path d="M${bx},${sY2} Q${bx+6},${sY2-4} ${bx+4},${sY2-8}"
+                  stroke="${clr.text2}" stroke-width="1.5" fill="none"/>`;
+    }
+
+    if (ev.duration <= 0.5 && i + 1 < melEvts.length && melEvts[i+1].duration <= 0.5) {
+      const nev  = melEvts[i+1];
+      const nbx  = _beatToX(nev.beat, cx0, CW);
+      const ny   = yStrFn(nev.stringIdx ?? 3);
+      const nSY2 = ny + r + 10;
+      out += `<line x1="${bx}" y1="${sY2}" x2="${nbx}" y2="${nSY2}"
+                  stroke="${clr.text2}" stroke-width="1.5"/>`;
+    }
+  });
+  return out;
+}
+
+
+/**
+ * _drawOverlapGroupLines
+ * 重なりグループ（inOverlapGroup=true）の音符群に
+ * 薄い下線（ブラケット）を描画してまとまりを示す。
+ */
+function _drawOverlapGroupLines(events, overlapMap, cx0, CW, yStrInRowFn, rowY, clr) {
+  let out = '';
+  const byString = {};
+  events.forEach(ev => {
+    if (!overlapMap.has(ev)) return;
+    const info = overlapMap.get(ev);
+    if (!info.inOverlapGroup) return;
+    const si = ev.stringIdx;
+    if (si == null) return;
+    if (!byString[si]) byString[si] = [];
+    byString[si].push({ ev, info });
+  });
+
+  Object.entries(byString).forEach(([si, items]) => {
+    if (items.length < 2) return;
+    items.sort((a, b) => a.ev.beat - b.ev.beat);
+
+    // 連続する重なりグループをランごとにまとめる
+    const runs = [];
+    let run = [items[0]];
+    for (let i = 1; i < items.length; i++) {
+      const xPrev = _beatToX(items[i-1].ev.beat, cx0, CW);
+      const xCur  = _beatToX(items[i].ev.beat, cx0, CW);
+      if (xCur - xPrev < (items[i-1].info.r + items[i].info.r) * 2) {
+        run.push(items[i]);
+      } else {
+        if (run.length >= 2) runs.push(run);
+        run = [items[i]];
+      }
+    }
+    if (run.length >= 2) runs.push(run);
+
+    const baseY = yStrInRowFn(Number(si), rowY);
+
+    runs.forEach(runItems => {
+      const x1 = _beatToX(runItems[0].ev.beat, cx0, CW) - runItems[0].info.r;
+      const x2 = _beatToX(runItems[runItems.length-1].ev.beat, cx0, CW) + runItems[runItems.length-1].info.r;
+      const lineY = baseY + 14; // 弦ラインの少し下
+
+      // ブラケット下線
+      out += `<line x1="${x1}" y1="${lineY}" x2="${x2}" y2="${lineY}"
+                   stroke="${clr.text2}" stroke-width="1" opacity="0.5"/>`;
+      // 端の縦ひげ
+      out += `<line x1="${x1}" y1="${lineY-3}" x2="${x1}" y2="${lineY}"
+                   stroke="${clr.text2}" stroke-width="1" opacity="0.5"/>`;
+      out += `<line x1="${x2}" y1="${lineY-3}" x2="${x2}" y2="${lineY}"
+                   stroke="${clr.text2}" stroke-width="1" opacity="0.5"/>`;
+      // 音符数バッジ
+      const midX = (x1 + x2) / 2;
+      out += `<text x="${midX}" y="${lineY + 8}" text-anchor="middle"
+                   font-size="7" fill="${clr.text2}" opacity="0.7"
+                   font-family="'DM Mono',monospace">${runItems.length}音</text>`;
+    });
+  });
+
+  return out;
+}
+
+// ---------------------------------------------------------------
+// [N1] _drawPlayStyleRow: 奏法アイコンを弦の下に表示
+// ---------------------------------------------------------------
+
+/**
+ * 小節内のイベントからピッキング/ストローク/親指などの奏法アイコンを描画する
+ *
+ * アイコン一覧:
+ *   picking  : ● (黒丸 + 点) →「指でピッキング」
+ *   strum    : ↓ or ↑     →「ストローク方向」
+ *   thumb    : ○T          →「親指」（ボサノバベース）
+ *   arpeggio : ~ (波線)     →「アルペジオ」
+ *
+ * beat位置ごとに最も目立つ奏法を1個表示
+ *
+ * @param {SoloEvent[]} evts    当該小節の全イベント
+ * @param {number}      cx0     小節左端X
+ * @param {number}      CW      小節幅
+ * @param {number}      y       アイコン行のY座標
+ * @param {Object}      clr
+ * @returns {string}
+ */
+function _drawPlayStyleRow(evts, cx0, CW, y, clr) {
+  let out = '';
+
+  // beat位置ごとにグルーピング（0.5刻み）
+  const beatGroups = {};
+  evts.forEach(ev => {
+    const key = ev.beat.toFixed(2);
+    if (!beatGroups[key]) beatGroups[key] = [];
+    beatGroups[key].push(ev);
+  });
+
+  Object.entries(beatGroups).forEach(([beatStr, group]) => {
+    const beat = parseFloat(beatStr);
+    const bx   = _beatToX(beat, cx0, CW);
+
+    // 優先度: thumb > arpeggio > mute > strum > picking
+    const styles = group.map(e => e.playStyle ?? 'picking');
+    const hasMute = group.some(e => e.isMute || e.technique === 'mute');
+    const playStyle = styles.includes('thumb')    ? 'thumb'
+                    : styles.includes('arpeggio') ? 'arpeggio'
+                    : hasMute                     ? 'mute'
+                    : styles.includes('strum')    ? 'strum'
+                    : 'picking';
+
+    // 声部に応じた色
+    const iconColor = group.some(e => e.voice === 'bass')    ? '#1D9E75'
+                    : group.some(e => e.voice === 'melody')  ? clr.text2
+                    : clr.text3 ?? clr.text2;
+
+    if (playStyle === 'thumb') {
+      // 親指記号: 小さな丸にT
+      out += `<circle cx="${bx}" cy="${y + 5}" r="6"
+                  fill="none" stroke="${iconColor}" stroke-width="1.2"/>`;
+      out += `<text x="${bx}" y="${y + 6}"
+                  text-anchor="middle" dominant-baseline="central"
+                  font-size="7" font-weight="700" fill="${iconColor}"
+                  font-family="'DM Mono',monospace">T</text>`;
+
+    } else if (playStyle === 'arpeggio') {
+      // 波線（arp記号）
+      out += `<text x="${bx}" y="${y + 8}"
+                  text-anchor="middle" dominant-baseline="central"
+                  font-size="10" fill="${iconColor}"
+                  font-family="serif">~</text>`;
+
+    } else if (playStyle === 'mute') {
+      // [A3] カッティング: × 記号（SVGラインで確実に表示）
+      { const hw = 4;
+        out += `<line x1="${bx-hw}" y1="${y+4-hw}" x2="${bx+hw}" y2="${y+4+hw}" stroke="${iconColor}" stroke-width="2"/>` +
+               `<line x1="${bx+hw}" y1="${y+4-hw}" x2="${bx-hw}" y2="${y+4+hw}" stroke="${iconColor}" stroke-width="2"/>`;
+      }
+
+    } else if (playStyle === 'strum') {
+      // ストローク矢印（ダウン↓）
+      // ストローク方向は ev.strumDir から取得（なければdown）
+      const dir = group.find(e => e.strumDir)?.strumDir ?? 'down';
+      const arrow = dir === 'up' ? '↑' : '↓';
+      out += `<text x="${bx}" y="${y + 8}"
+                  text-anchor="middle" dominant-baseline="central"
+                  font-size="10" fill="${iconColor}"
+                  font-family="sans-serif">${arrow}</text>`;
+
+    } else {
+      // picking: 小さな塗り丸（指先）
+      out += `<circle cx="${bx}" cy="${y + 5}" r="2.5"
+                  fill="${iconColor}"/>`;
+    }
+  });
+
+  return out;
+}
+</script>

@@ -1,0 +1,2477 @@
+<script>
+// ===================================================================
+// js_melodyEngine.txt  ― メロディ・ハーモニー調和タブ譜エンジン v3
+//
+// v2 → v3 の最大変更: 「全体俯瞰型メロディ設計」への刷新
+//
+// 【旧アーキテクチャの問題】
+//   小節ループ × ローカルルール積み重ね
+//   → 全体の方向性がなく「音符の羅列」になる
+//   → コードを1つ追加しても隣の小節を見ていない
+//
+// 【新アーキテクチャ: 2フェーズ設計】
+//   Phase G (Global): 全コード進行を俯瞰して「メロディ骨格」を先に確定
+//     G1: 進行タイプ自動判定（15パターン）
+//     G2: 全体フォルム決定（arch/rise/fall/valley）
+//     G3: フレーズ境界を先に確定（4小節単位）
+//     G4: 各フレーズの「頂点音・開始音・終止音」をMIDIで先決め
+//     G5: 各小節の「目標音 targetMidi」をテーブルとして確定
+//   Phase L (Local): 小節ループ時に骨格を参照しながら音符配置
+//     L1: beat3アンカー廃止（骨格のtargetMidiに従う）
+//     L2: モチーフidxを2小節またぎに変更（フレーズ感を出す）
+//     L3: 弱拍コイントス廃止（骨格の方向性に従う）
+//     L4: フレット超過時のreturn廃止（オクターブ補正で継続）
+//     L5: preferredStrings をC/G弦含む全弦に拡張
+//
+// コードを追加・変更するたびに buildSoloScore() / buildScoreFromChords()
+// が呼ばれ、Phase Gが全コード進行を再分析して骨格を再計算する。
+// ===================================================================
+
+// ---------------------------------------------------------------
+// データ構造定義（全フェーズ共通）
+// ---------------------------------------------------------------
+
+/**
+ * 1音符を表すオブジェクト
+ * @typedef {Object} NoteEvent
+ */
+
+/**
+ * 1小節を表すオブジェクト
+ * @typedef {Object} Measure
+ */
+
+/**
+ * スコア全体を表すオブジェクト
+ * @typedef {Object} Score
+ */
+
+// ---------------------------------------------------------------
+// ファクトリ関数
+// ---------------------------------------------------------------
+
+function makeNoteEvent(midi, duration, beat, role='passing') {
+  return {
+    type:         midi < 0 ? 'rest' : 'note',
+    midi,
+    duration,
+    beat,
+    stringIdx:    null,
+    fret:         null,
+    role,
+    technique:    'normal',
+    tieOut:       false,  // [Lyrical] 次音へタイ接続するか
+    sustainHint:  false,  // [Lyrical] 余韻保持を優先する音か
+  };
+}
+
+function makeScore(key, chordNames, style = 'arpeggio', genre = null) {
+  const preset = genre ? (GENRE_PRESETS?.[genre] ?? null) : null;
+  return {
+    key,
+    tempo:         preset ? preset.tempo : 100,
+    timeSignature: [4, 4],
+    style,
+    genre,
+    measures: chordNames.map((chord, i) => ({
+      number:      i + 1,
+      chord,
+      chordFrets:  _resolveChordFrets(chord, key),
+      melody:      [],
+      beatsPerBar: 4,
+    })),
+  };
+}
+
+function _resolveChordFrets(chordName, key) {
+  const candidates = getChordCandidates(chordName, key, 'low');
+  if (candidates.length === 0) return [0, 0, 0, 0];
+  return candidates[0].frets;
+}
+
+// ---------------------------------------------------------------
+// Phase 2 ①：コード構成音の音度情報を取得する
+// ---------------------------------------------------------------
+
+function getChordStructure(chordName) {
+  // [P2-3] スラッシュコード処理: "C/E" → ルートはC、ベース音Eは構造解析では無視
+  //   分母のベース音はタブ譜のボイシング層で別途処理されるため、ここでは上声部のみ解析
+  //
+  // [Fix] "6/9" や "6/9" 形式のコードを誤処理しないよう判定を厳密化:
+  //   '/' の後ろが音名 (A-G, フラット/シャープ含む) の場合のみスラッシュコードとして扱う
+  //   例: 'C/E'  → スラッシュコード → baseName='C'    ✓
+  //       'C6/9' → 分数表記の一部  → baseName='C6/9' ✓（誤処理を防ぐ）
+  const slashIdx = chordName.indexOf('/');
+  const isSlashChord = slashIdx > 0 && /^[A-G][b#]?/.test(chordName.slice(slashIdx + 1));
+  const baseName = isSlashChord ? chordName.slice(0, slashIdx) : chordName;
+
+  const rootMatch = baseName.match(/^([A-G][b#]?)/);
+  if (!rootMatch) return null;
+  const rootStr = rootMatch[1];
+
+  const ROOT_PC = {
+    'C':0,'C#':1,'Db':1,'D':2,'D#':3,'Eb':3,
+    'E':4,'F':5,'F#':6,'Gb':6,'G':7,'G#':8,
+    'Ab':8,'A':9,'A#':10,'Bb':10,'B':11,
+  };
+  const rootPc = ROOT_PC[rootStr];
+  if (rootPc === undefined) return null;
+
+  const suffix = baseName.slice(rootStr.length);
+
+  let semitones, roleNames;
+
+  // ── 既存サフィックス ──────────────────────────────────────────
+  if      (suffix === 'maj7')              { semitones=[0,4,7,11];       roleNames=['root','color','stable','tension']; }
+  else if (suffix === 'm7')                { semitones=[0,3,7,10];       roleNames=['root','color','stable','tension']; }
+  else if (suffix === 'm7b5'||suffix==='ø'){ semitones=[0,3,6,10];       roleNames=['root','color','color','tension'];  }
+  else if (suffix === 'dim7')              { semitones=[0,3,6,9];        roleNames=['root','color','color','tension'];  }
+  else if (suffix === 'dim')               { semitones=[0,3,6];          roleNames=['root','color','color'];            }
+  else if (suffix === 'aug')               { semitones=[0,4,8];          roleNames=['root','color','stable'];           }
+  else if (suffix === 'sus4')              { semitones=[0,5,7];          roleNames=['root','color','stable'];           }
+  else if (suffix === 'sus2')              { semitones=[0,2,7];          roleNames=['root','color','stable'];           }
+  else if (suffix === '6')                 { semitones=[0,4,7,9];        roleNames=['root','color','stable','tension']; }
+  else if (suffix === 'm6')                { semitones=[0,3,7,9];        roleNames=['root','color','stable','tension']; }
+  else if (suffix === '9')                 { semitones=[0,4,7,10,14];    roleNames=['root','color','stable','tension','tension']; }
+  else if (suffix === 'm9')                { semitones=[0,3,7,10,14];    roleNames=['root','color','stable','tension','tension']; }
+  else if (suffix === '7')                 { semitones=[0,4,7,10];       roleNames=['root','color','stable','tension']; }
+  else if (suffix === 'm')                 { semitones=[0,3,7];          roleNames=['root','color','stable'];           }
+
+  // ── [P2-3] 追加サフィックス ──────────────────────────────────
+  // add9: 長3度+完全5度+長9度（7thなし。明るい色彩感）
+  else if (suffix === 'add9')              { semitones=[0,4,7,14];       roleNames=['root','color','stable','tension']; }
+  // madd9 / m(add9): マイナー+9th（7thなし）
+  else if (suffix === 'madd9'||suffix==='m(add9)') { semitones=[0,3,7,14]; roleNames=['root','color','stable','tension']; }
+  // maj9: maj7+9th
+  else if (suffix === 'maj9')              { semitones=[0,4,7,11,14];    roleNames=['root','color','stable','tension','tension']; }
+  // 11: ドミナント11th（V11コード）
+  else if (suffix === '11')                { semitones=[0,4,7,10,14,17]; roleNames=['root','color','stable','tension','tension','color']; }
+  // m11: マイナー11th
+  else if (suffix === 'm11')               { semitones=[0,3,7,10,14,17]; roleNames=['root','color','stable','tension','tension','color']; }
+  // maj11: maj7+9+11
+  else if (suffix === 'maj11')             { semitones=[0,4,7,11,14,17]; roleNames=['root','color','stable','tension','tension','color']; }
+  // 13: ドミナント13th（9thは省略可）
+  else if (suffix === '13')                { semitones=[0,4,7,10,14,21]; roleNames=['root','color','stable','tension','tension','color']; }
+  // m13: マイナー13th
+  else if (suffix === 'm13')               { semitones=[0,3,7,10,14,21]; roleNames=['root','color','stable','tension','tension','color']; }
+  // maj13: maj7+9+13
+  else if (suffix === 'maj13')             { semitones=[0,4,7,11,14,21]; roleNames=['root','color','stable','tension','tension','color']; }
+  // 7sus4: ドミナント7th+sus4（サスペンドドミナント）
+  else if (suffix === '7sus4')             { semitones=[0,5,7,10];       roleNames=['root','color','stable','tension']; }
+  // 7sus2
+  else if (suffix === '7sus2')             { semitones=[0,2,7,10];       roleNames=['root','color','stable','tension']; }
+  // aug7 / 7#5: オーギュメントドミナント
+  else if (suffix === 'aug7'||suffix==='7#5'||suffix==='7+5') {
+                                             semitones=[0,4,8,10];       roleNames=['root','color','color','tension'];  }
+  // 7b9: ドミナント7th + フラット9th（強い解決感）
+  else if (suffix === '7b9')               { semitones=[0,4,7,10,13];    roleNames=['root','color','stable','tension','tension']; }
+  // 7#9: ドミナント7th + シャープ9th（ヘンドリクスコード）
+  else if (suffix === '7#9')               { semitones=[0,4,7,10,15];    roleNames=['root','color','stable','tension','tension']; }
+  // 6/9: 6th + 9th（7thなし）
+  else if (suffix === '6/9'||suffix==='69'){ semitones=[0,4,7,9,14];     roleNames=['root','color','stable','tension','tension']; }
+  // フォールバック: メジャートライアド
+  else                                     { semitones=[0,4,7];          roleNames=['root','color','stable'];           }
+
+  const intervals = {};
+  semitones.forEach((s, i) => {
+    const pc = s % 12;
+    if (!(pc in intervals)) {
+      intervals[pc] = roleNames[i];
+    }
+  });
+
+  return { rootPc, intervals };
+}
+
+// ---------------------------------------------------------------
+// Phase 2 ②：classifyNote
+// ---------------------------------------------------------------
+
+function classifyNote(midi, chordName, key, scaleMode = 'major') {
+  const pc = midi % 12;
+
+  if (scaleMode === 'blues') {
+    const keyDef  = KEY_DEFS.find(d => d.key === key);
+    const rootIdx = keyDef ? keyDef.idx : 0;
+    const offset  = (pc - rootIdx + 12) % 12;
+    if (offset === 6) return 'color';
+  }
+
+  const struct = getChordStructure(chordName);
+  if (struct) {
+    const offset = (pc - struct.rootPc + 12) % 12;
+    if (offset in struct.intervals) {
+      return struct.intervals[offset];
+    }
+  }
+
+  const keyDef  = KEY_DEFS.find(d => d.key === key);
+  const rootIdx = keyDef ? keyDef.idx : 0;
+
+  // [P1-4] コード機能に応じてスケールモードを切り替える
+  // 曲全体の scaleMode を基準に、個別コードの性質で上書き判定する
+  const effectiveMode = _getChordScaleMode(struct, scaleMode);
+
+  const modeScale = (typeof buildModeScale === 'function')
+    ? buildModeScale(struct ? struct.rootPc : rootIdx, effectiveMode)
+    : (KEY_DATA[key]?.scale || []);
+  const scalePcs = new Set(modeScale.map(n => CHROMATIC.indexOf(n)));
+  if (scalePcs.has(pc)) {
+    return 'passing';
+  }
+
+  return 'chromatic';
+}
+
+/**
+ * [P1-4] コード構造からそのコードで使うべきスケールモードを推定する。
+ *
+ * 判定優先順:
+ *   1. ドミナント7th コード (suffix '7') → mixolydian
+ *      セカンダリードミナントもここに入る（キー外のルートでも適用）
+ *   2. マイナーコード (m, m7, m9) → dorian
+ *      ドリアンはナチュラルマイナーより長6度を含み、ポップ/ジャズで自然に響く
+ *   3. ハーフディミニッシュ (m7b5) → minor（ロクリアン的）
+ *   4. ディミニッシュ (dim, dim7) → chromatic approach（全音音階的; 既存のchromatic扱いに委ねる）
+ *   5. それ以外 → 引数の scaleMode をそのまま使う
+ *
+ * @param {Object|null} struct  getChordStructure の返り値
+ * @param {string} globalMode   曲全体の scaleMode
+ * @returns {string}  SCALE_MODES のキー
+ */
+function _getChordScaleMode(struct, globalMode) {
+  if (!struct) return globalMode;
+
+  const ivls = struct.intervals; // { semiOffset: role }
+
+  // intervals のキー(半音数)の集合
+  const has = (semi) => semi in ivls;
+
+  // ドミナント7th: 長3度(4) + 短7度(10) を持つ
+  if (has(4) && has(10) && !has(11)) return 'mixolydian';
+
+  // ハーフディミニッシュ: 短3度(3) + 減5度(6) + 短7度(10)
+  if (has(3) && has(6) && has(10)) return 'minor';
+
+  // マイナー系: 短3度(3) を持ち、減5度(6) を持たない
+  if (has(3) && !has(6)) return 'dorian';
+
+  // ディミニッシュ: 短3度(3) + 減5度(6)、7度なし
+  // → 全音音階/コンビネーションオブディミニッシュが理想だが
+  //   複雑になるので minor にフォールバック
+  if (has(3) && has(6) && !has(10)) return 'minor';
+
+  return globalMode;
+}
+
+// ---------------------------------------------------------------
+// Phase 2 ③：buildChordMidiSet
+// ---------------------------------------------------------------
+
+function buildChordMidiSet(
+  chordName,
+  key,
+  midiLow  = UKULELE_MIDI_RANGE.melodyLow,
+  midiHigh = UKULELE_MIDI_RANGE.melodyHigh
+) {
+  const struct = getChordStructure(chordName);
+  if (!struct) return [];
+
+  const results = [];
+  for (let midi = midiLow; midi <= midiHigh; midi++) {
+    const pc     = midi % 12;
+    const offset = (pc - struct.rootPc + 12) % 12;
+    if (offset in struct.intervals) {
+      results.push({ midi, role: struct.intervals[offset] });
+    }
+  }
+
+  const ROLE_ORDER = { root:0, stable:1, color:2, tension:3 };
+  results.sort((a, b) => {
+    const d = (ROLE_ORDER[a.role] ?? 9) - (ROLE_ORDER[b.role] ?? 9);
+    return d !== 0 ? d : a.midi - b.midi;
+  });
+
+  return results;
+}
+
+// ---------------------------------------------------------------
+// Phase 2 ④：buildScaleMidiSet
+// ---------------------------------------------------------------
+
+function buildScaleMidiSet(
+  key,
+  chordName,
+  midiLow  = UKULELE_MIDI_RANGE.melodyLow,
+  midiHigh = UKULELE_MIDI_RANGE.melodyHigh,
+  scaleMode = 'major'
+) {
+  const results = [];
+
+  for (let midi = midiLow; midi <= midiHigh; midi++) {
+    const role = classifyNote(midi, chordName, key, scaleMode);
+    if (role !== 'chromatic') {
+      results.push({ midi, role });
+    }
+  }
+
+  const ROLE_ORDER = { root:0, stable:1, color:2, tension:3, passing:4 };
+  results.sort((a, b) => {
+    const d = (ROLE_ORDER[a.role] ?? 9) - (ROLE_ORDER[b.role] ?? 9);
+    return d !== 0 ? d : a.midi - b.midi;
+  });
+
+  return results;
+}
+
+// ---------------------------------------------------------------
+// Phase 2 ⑤：コード間の共通トーン検出
+// ---------------------------------------------------------------
+
+function getCommonTones(chordA, chordB) {
+  const sA = getChordStructure(chordA);
+  const sB = getChordStructure(chordB);
+  if (!sA || !sB) return [];
+
+  const pcsA = new Set(
+    Object.keys(sA.intervals).map(Number).map(offset => (sA.rootPc + offset) % 12)
+  );
+  const pcsB = new Set(
+    Object.keys(sB.intervals).map(Number).map(offset => (sB.rootPc + offset) % 12)
+  );
+
+  return [...pcsA].filter(pc => pcsB.has(pc));
+}
+
+// ---------------------------------------------------------------
+// Phase 3 ①：リズムパターン定義
+// ---------------------------------------------------------------
+
+const RHYTHM_PATTERNS = {
+  quarter:    [1, 1, 1, 1],
+  eighth:     [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],
+  dotted:     [1.5,0.5,1.5,0.5],
+  syncopated: [0.5,1,0.5, 0.5,1,0.5],
+  ballad:     [2, 1, 1],
+  swing:      [0.75,0.25,0.75,0.25,0.75,0.25,0.75,0.25],
+  mixed:      [1, 0.5, 0.5, 0.5, 0.5, 1],
+};
+
+// ---------------------------------------------------------------
+// Phase 3 ②：奏法判定
+// ---------------------------------------------------------------
+
+function assignTechnique(prevSi, prevFret, si, fret) {
+  if (fret === 0) return 'open';
+  if (prevSi < 0 || prevSi !== si) return 'normal';
+  const diff = fret - prevFret;
+  if (diff === 0) return 'normal';
+  if (diff === 1 || diff === 2)  return 'hammer_on';
+  if (diff === -1 || diff === -2) return 'pull_off';
+  if (Math.abs(diff) >= 3 && Math.abs(diff) <= 5) return 'slide';
+  return 'normal';
+}
+
+// ---------------------------------------------------------------
+// Phase 3 ③：拍の強弱
+// ---------------------------------------------------------------
+
+function getBeatStrength(beat, beatsPerBar = 4) {
+  if (beat === 1)              return 'strong';
+  if (beat % 1 !== 0)          return 'offbeat';
+  if (beatsPerBar === 4 && beat === 3) return 'medium';
+  return 'weak';
+}
+
+// ---------------------------------------------------------------
+// ★ Phase G: 全体俯瞰型メロディ骨格設計（v3新設）
+// ---------------------------------------------------------------
+
+/**
+ * G1: コード進行タイプを自動判定する
+ *
+ * chordNames をキーからの度数列（PC差）に変換し、
+ * 15種類の進行パターンと照合する。
+ * 一致した進行タイプに応じて:
+ *   - フォルム形状 (form)
+ *   - テンション配置 (tensionMeasures: 頂点になる小節リスト)
+ *   - 推奨モチーフ方向 (motifShape)
+ * を返す。
+ *
+ * @param {string[]} chordNames  コード進行
+ * @param {string}   key         キー名
+ * @returns {{ type:string, form:string, tensionMeasures:number[], motifShape:string }}
+ */
+function _classifyProgression(chordNames, key) {
+  const keyDef = KEY_DEFS.find(d => d.key === key);
+  const ki     = keyDef ? keyDef.idx : 0;
+
+  // 各コードのルートPCをキーからの度数（半音差）に変換
+  const degrees = chordNames.map(c => {
+    const s = getChordStructure(c);
+    if (!s) return -1;
+    return (s.rootPc - ki + 12) % 12;
+  });
+
+  // 進行パターン定義
+  // deg: 度数列（0=I, 2=II, 4=III, 5=IV, 7=V, 9=VI, 11=VII）
+  const PATTERNS = [
+    // ─ 日本のポップ定番 ─
+    { type: 'oh_well',     deg:[0,7,9,5],  form:'arch',   motifShape:'arch_gentle',  label:'王道進行(I-V-VIm-IV)' },
+    { type: 'komuro',      deg:[9,5,0,7],  form:'valley', motifShape:'valley_leap',  label:'小室進行(VIm-IV-I-V)' },
+    { type: 'pachelbel',   deg:[0,7,4,9,5,0,5,7], form:'down', motifShape:'fall_cascade', label:'カノン進行' },
+    { type: 'pop_minor',   deg:[9,7,0,7],  form:'valley', motifShape:'valley_step',  label:'マイナーポップ(VIm-V-I-V)' },
+    { type: 'four_chord',  deg:[0,5,7,5],  form:'arch',   motifShape:'rise_penta',   label:'4コード(I-IV-V-IV)' },
+    // ─ ジャズ・洒落た進行 ─
+    { type: 'two_five_one', deg:[2,7,0,0], form:'down',   motifShape:'fall_resolve', label:'II-V-I' },
+    { type: 'one_six',     deg:[0,9,5,7],  form:'arch',   motifShape:'arch_short',   label:'I-VIm-IV-V' },
+    { type: 'jazz_minor',  deg:[9,2,7,0],  form:'valley', motifShape:'turn',         label:'VIm-IIm-V-I' },
+    // ─ ブルース ─
+    { type: 'blues',       deg:[0,5,7,0],  form:'valley', motifShape:'neighbor_up',  label:'ブルース(I-IV-V)' },
+    { type: 'blues12',     deg:[0,0,0,0,5,5,0,0,7,5,0,7], form:'valley', motifShape:'neighbor_up', label:'12barブルース' },
+    // ─ フォーク・シンプル ─
+    { type: 'folk_up',     deg:[0,2,4,5],  form:'up',     motifShape:'rise_step',    label:'上昇フォーク(I-II-III-IV)' },
+    { type: 'folk_down',   deg:[0,7,5,4],  form:'down',   motifShape:'fall_step',    label:'下降フォーク(I-V-IV-III)' },
+    // ─ バラード ─
+    { type: 'ballad_main', deg:[0,9,5,7],  form:'arch',   motifShape:'arch_leap',    label:'バラード王道' },
+    { type: 'ballad_fall', deg:[0,11,9,7], form:'down',   motifShape:'fall_cascade', label:'クリシェ下降' },
+    // ─ デフォルト ─
+    { type: 'generic',     deg:[],         form:'arch',   motifShape:'arch_gentle',  label:'その他' },
+  ];
+
+  // [P2-2] 終止形パターン定義（最後の2コードで照合）
+  // cadenceScore: 終止形が一致したときのスコア加算量
+  const CADENCE_PATTERNS = [
+    { degs: [7, 0],  score: 30, label: '完全終止(V-I)' },
+    { degs: [2, 7, 0], score: 35, label: 'II-V-I終止' },
+    { degs: [5, 0],  score: 20, label: '下属終止(IV-I)' },
+    { degs: [7, 9],  score: 15, label: '偽終止(V-VIm)' },
+    { degs: [5, 7],  score: 10, label: '半終止(IV-V)' },
+  ];
+
+  // 度数の近似一致判定（±1半音 または 11半音差を許容）
+  function degMatch(a, b) {
+    if (a < 0) return false;
+    return Math.abs(a - b) <= 1 || Math.abs(a - b) === 11;
+  }
+
+  // 終止形スコアを計算する
+  function calcCadenceScore(patDeg) {
+    let cadScore = 0;
+    for (const cad of CADENCE_PATTERNS) {
+      const n = cad.degs.length;
+      if (degrees.length < n) continue;
+      const tail = degrees.slice(-n);
+      if (cad.degs.every((d, i) => degMatch(tail[i], d))) {
+        cadScore = Math.max(cadScore, cad.score);
+      }
+    }
+    return cadScore;
+  }
+
+  // 全体n-gram一致スコア: パターン全体に対する一致度（0〜1）× 20
+  function calcNgramScore(patDeg) {
+    if (patDeg.length === 0) return 0;
+    const checkLen = Math.min(patDeg.length, degrees.length);
+    let matches = 0;
+    for (let i = 0; i < checkLen; i++) {
+      if (degMatch(degrees[i], patDeg[i])) matches++;
+    }
+    return (matches / checkLen) * 20;
+  }
+
+  const n = Math.min(degrees.length, 8);
+
+  // ── 第1フェーズ: 先頭一致で候補を絞り込む ──
+  const candidates = [];
+  for (const pat of PATTERNS) {
+    if (pat.deg.length === 0) continue;
+    const checkLen = Math.min(pat.deg.length, n);
+    const headMatch = pat.deg.slice(0, checkLen).every((d, i) => degMatch(degrees[i], d));
+    if (headMatch) {
+      candidates.push(pat);
+    }
+  }
+
+  // 候補が1つなら即返す（従来どおり高速パス）
+  if (candidates.length === 1) return candidates[0];
+
+  // ── 第2フェーズ: 候補が複数 or ゼロ → スコアリングで決定 ──
+  const scoredPatterns = (candidates.length > 0 ? candidates : PATTERNS.filter(p => p.deg.length > 0))
+    .map(pat => {
+      const headScore   = calcNgramScore(pat.deg);
+      const cadScore    = calcCadenceScore(pat.deg);
+      const total       = headScore + cadScore;
+      return { pat, total };
+    });
+
+  scoredPatterns.sort((a, b) => b.total - a.total);
+
+  // スコア最大のパターンを返す（同点ならリスト順で先のものを優先）
+  if (scoredPatterns.length > 0 && scoredPatterns[0].total > 0) {
+    return scoredPatterns[0].pat;
+  }
+
+  return PATTERNS.find(p => p.type === 'generic');
+}
+
+/**
+ * G1.5: コード進行からフレーズ長を推定する。[可変フレーズ化]
+ *
+ * 推定ロジック（優先順）:
+ *   1. 終止形検出: V→I / IV→I / II-V-I 等の終止形が現れる周期を検出
+ *   2. コード繰り返し: 同じコード列が繰り返される場合、その単位長を採用
+ *   3. コード変化密度: 総コード数が少ない(≦3)→2、多い(≧9)→4にクランプ
+ *   4. デフォルト: 4
+ *
+ * @param {string[]} chordNames  コード進行
+ * @param {string}   key         キー名
+ * @returns {number[]}  各フレーズの長さの配列 (例: [4,4,4,4] or [3,3,2] など)
+ */
+function _estimatePhraseLen(chordNames, key) {
+  const total = chordNames.length;
+  if (total <= 2) return [total];
+
+  const keyDef = KEY_DEFS.find(d => d.key === key);
+  const ki     = keyDef ? keyDef.idx : 0;
+
+  // 度数列に変換（解析失敗は-1）
+  const degs = chordNames.map(c => {
+    const s = getChordStructure(c);
+    return s ? (s.rootPc - ki + 12) % 12 : -1;
+  });
+
+  // ── 1. 終止形周期の検出 ──
+  // V→I (7→0), IV→I (5→0), II-V-I の "→I" の位置を終止点候補とする
+  const cadencePositions = [];
+  for (let i = 1; i < total; i++) {
+    const prev = degs[i - 1], cur = degs[i];
+    if (cur === 0 && (prev === 7 || prev === 5)) {
+      cadencePositions.push(i); // I に解決した小節インデックス
+    }
+    // II-V-I の V→I
+    if (cur === 0 && prev === 7 && i >= 2 && degs[i - 2] === 2) {
+      cadencePositions.push(i);
+    }
+  }
+  // 重複除去・ソート
+  const uniqCad = [...new Set(cadencePositions)].sort((a, b) => a - b);
+
+  if (uniqCad.length >= 2) {
+    // 終止間隔の最頻値をフレーズ長の候補にする
+    const intervals = [];
+    let prev = -1;
+    for (const pos of uniqCad) {
+      if (prev >= 0) intervals.push(pos - prev);
+      prev = pos;
+    }
+    // 最頻値
+    const freq = {};
+    intervals.forEach(v => { freq[v] = (freq[v] || 0) + 1; });
+    const modalLen = Object.entries(freq).sort((a, b) => b[1] - a[1])[0]?.[0];
+    const len = parseInt(modalLen, 10);
+    if (len >= 2 && len <= 8) {
+      // 終止位置でフレーズを区切る
+      return _buildPhraseLensFromBoundaries(uniqCad, total, len);
+    }
+  }
+
+  // ── 2. コード列の繰り返し検出 ──
+  // 前半N小節と後半N小節が一致する最小Nを探す
+  for (let n = 2; n <= Math.floor(total / 2); n++) {
+    const first = chordNames.slice(0, n).join(',');
+    const second = chordNames.slice(n, n * 2).join(',');
+    if (first === second) {
+      return _buildPhraseLensFromPeriod(n, total);
+    }
+  }
+
+  // ── 3. コード変化密度によるクランプ ──
+  const uniqueChords = new Set(chordNames).size;
+  let defaultLen = 4;
+  if (uniqueChords <= 2)      defaultLen = 2;
+  else if (uniqueChords <= 3) defaultLen = 3; // 3コード進行（フォーク等）
+  else if (total >= 9)        defaultLen = 4;
+
+  return _buildPhraseLensFromPeriod(defaultLen, total);
+}
+
+/** 終止位置配列からフレーズ長配列を生成する */
+function _buildPhraseLensFromBoundaries(cadPositions, total, hintLen) {
+  const phraseLens = [];
+  let start = 0;
+  // 終止位置（含む）までを1フレーズとする
+  for (const pos of cadPositions) {
+    const len = pos - start + 1;
+    if (len > 0) phraseLens.push(len);
+    start = pos + 1;
+  }
+  // 残り
+  if (start < total) phraseLens.push(total - start);
+  // 長すぎるフレーズはhintLenで分割
+  const result = [];
+  for (const l of phraseLens) {
+    if (l > hintLen * 2) {
+      let rem = l;
+      while (rem > 0) {
+        result.push(Math.min(hintLen, rem));
+        rem -= hintLen;
+      }
+    } else {
+      result.push(l);
+    }
+  }
+  return result.filter(l => l > 0);
+}
+
+/** 固定周期からフレーズ長配列を生成する */
+function _buildPhraseLensFromPeriod(period, total) {
+  const result = [];
+  let rem = total;
+  while (rem > 0) {
+    result.push(Math.min(period, rem));
+    rem -= period;
+  }
+  return result;
+}
+
+/**
+ * _getPhraseContext: 小節インデックスmi からフレーズ情報を一元取得する。[可変フレーズ化]
+ *
+ * skeleton の phraseBoundaries（各フレーズの [start, end] 配列）を参照し、
+ * mi が属するフレーズの情報をまとめて返す。
+ *
+ * @param {number} mi        小節インデックス
+ * @param {number} total     総小節数
+ * @param {Object} skeleton  _buildMelodySkeleton の返り値（phraseBoundariesを含む）
+ * @returns {{
+ *   phraseIdx:    number,   // フレーズ番号（0始まり）
+ *   phraseLen:    number,   // このフレーズの長さ
+ *   phraseTotal:  number,   // このフレーズの実際の小節数（末尾フレーズは短い場合あり）
+ *   posInPhrase:  number,   // フレーズ内の絶対位置（0始まり）
+ *   posRatio:     number,   // フレーズ内の正規化比率（0.0〜1.0）
+ *   role:         string,   // 'intro'|'develop'|'climax'|'resolve'
+ *   phraseCount:  number,   // 総フレーズ数
+ * }}
+ */
+function _getPhraseContext(mi, total, skeleton) {
+  const boundaries = skeleton?.phraseBoundaries;
+
+  // skeleton未設定のフォールバック（旧来の4小節固定）
+  if (!boundaries || boundaries.length === 0) {
+    const phraseLen   = 4;
+    const phraseIdx   = Math.floor(mi / phraseLen);
+    const posInPhrase = mi % phraseLen;
+    const phraseTotal = Math.min(phraseLen, total - phraseIdx * phraseLen);
+    const posRatio    = posInPhrase / Math.max(phraseTotal - 1, 1);
+    const role        = _posRatioToRole(posRatio, posInPhrase, phraseTotal);
+    return { phraseIdx, phraseLen, phraseTotal, posInPhrase, posRatio, role,
+             phraseCount: Math.ceil(total / phraseLen) };
+  }
+
+  // phraseBoundaries = [{start, end, len}, ...] 配列で境界を引く
+  for (let pi = 0; pi < boundaries.length; pi++) {
+    const { start, end, len } = boundaries[pi];
+    if (mi >= start && mi <= end) {
+      const phraseTotal  = end - start + 1;
+      const posInPhrase  = mi - start;
+      const posRatio     = posInPhrase / Math.max(phraseTotal - 1, 1);
+      const role         = _posRatioToRole(posRatio, posInPhrase, phraseTotal);
+      return { phraseIdx: pi, phraseLen: len, phraseTotal, posInPhrase,
+               posRatio, role, phraseCount: boundaries.length };
+    }
+  }
+
+  // 範囲外（末尾小節の場合など）→ 最後のフレーズ末として扱う
+  const last = boundaries[boundaries.length - 1];
+  return { phraseIdx: boundaries.length - 1, phraseLen: last.len,
+           phraseTotal: last.end - last.start + 1,
+           posInPhrase: last.end - last.start,
+           posRatio: 1.0, role: 'resolve',
+           phraseCount: boundaries.length };
+}
+
+/**
+ * 正規化比率とフレーズ長から役割を判定する。
+ * 比率を4段階ロール（intro/develop/climax/resolve）にマッピング。
+ * フレーズ長に依存せず比率で判定するのがポイント。
+ */
+function _posRatioToRole(posRatio, posInPhrase, phraseTotal) {
+  if (phraseTotal <= 2) {
+    return posInPhrase === 0 ? 'intro' : 'resolve';
+  }
+  if (phraseTotal === 3) {
+    if (posInPhrase === 0) return 'intro';
+    if (posInPhrase === 1) return 'climax';
+    return 'resolve';
+  }
+  // 4小節以上: 比率で4段階に分割
+  if (posRatio < 0.25)       return 'intro';
+  if (posRatio < 0.55)       return 'develop';
+  if (posRatio < 0.80)       return 'climax';
+  return 'resolve';
+}
+
+/**
+ * G2: 全体フォルムから、各小節の「目標MIDI」テーブルを生成する。[可変フレーズ化対応]
+ *
+ * フォルム形状（arch/up/down/valley）に従い、全小節分の
+ * targetMidi配列を返す。各小節のメロディ生成はこの値を参照する。
+ *
+ * @param {string}   form         'arch'|'up'|'down'|'valley'
+ * @param {number}   total        総小節数
+ * @param {number}   lo           音域下限MIDI
+ * @param {number}   hi           音域上限MIDI
+ * @param {number[]} tensionMiArr テンション配置ヒント（省略可）
+ * @param {number[]} phraseLens   フレーズ長配列（省略時は[4,4,...]）
+ * @returns {{ targets, phraseBoundaries, peakMeasures, isQuestionPhrase }}
+ */
+function _buildMelodySkeleton(form, total, lo, hi, tensionMiArr = [], phraseLens = null) {
+  const targets      = [];
+  const peakMeasures = [];
+
+  // フレーズ境界テーブルを構築
+  const resolvedLens = phraseLens && phraseLens.length > 0
+    ? phraseLens
+    : _buildPhraseLensFromPeriod(4, total);
+
+  // phraseBoundaries: [{start, end, len}, ...]
+  const phraseBoundaries = [];
+  let cursor = 0;
+  for (const len of resolvedLens) {
+    const start = cursor;
+    const end   = Math.min(cursor + len - 1, total - 1);
+    phraseBoundaries.push({ start, end, len });
+    cursor = end + 1;
+    if (cursor >= total) break;
+  }
+  const phraseCount = phraseBoundaries.length;
+
+  // phraseStarts（後方互換用）
+  const phraseStarts = phraseBoundaries.map(b => b.start);
+
+  const MID  = Math.round((lo + hi) / 2);
+  const LOW  = lo  + Math.round((hi - lo) * 0.10);
+  const HIGH = hi  - Math.round((hi - lo) * 0.10);
+
+  for (let mi = 0; mi < total; mi++) {
+    // _getPhraseContext を使って正規化比率を取得
+    // (skeletonはまだ完成していないので phraseBoundaries を直接渡す仮骨格を使う)
+    const tmpSkeleton = { phraseBoundaries };
+    const ctx = _getPhraseContext(mi, total, tmpSkeleton);
+    const { phraseIdx, posRatio, posInPhrase, phraseTotal, role } = ctx;
+
+    const t           = posRatio;
+    const phaseOffset = (phraseIdx % 2 === 1) ? 0.15 : 0;
+    const isLastPhrase = phraseIdx === phraseCount - 1;
+
+    let target;
+
+    switch (form) {
+      case 'arch': {
+        const tAdj = t + phaseOffset;
+        const arch = 4 * tAdj * (1 - tAdj);
+        target = Math.round(LOW + arch * (HIGH - LOW));
+        if (role === 'develop' || role === 'climax') peakMeasures.push(mi);
+        break;
+      }
+      case 'up': {
+        if (isLastPhrase && posInPhrase >= phraseTotal - 2) {
+          target = MID;
+        } else {
+          target = Math.round(LOW + t * (HIGH - LOW));
+        }
+        if (role === 'climax') peakMeasures.push(mi);
+        break;
+      }
+      case 'down': {
+        const isFirstPhrase = phraseIdx === 0;
+        const startPoint = isFirstPhrase ? HIGH : Math.round(MID + (HIGH - MID) * 0.5);
+        target = Math.round(startPoint - t * (startPoint - LOW));
+        if (role === 'intro') peakMeasures.push(mi);
+        break;
+      }
+      case 'valley': {
+        const valley = 1 - 4 * (t - 0.5) * (t - 0.5);
+        target = Math.round(HIGH - valley * (HIGH - LOW));
+        if (role === 'intro' || role === 'resolve') peakMeasures.push(mi);
+        break;
+      }
+      default:
+        target = MID;
+    }
+
+    if (tensionMiArr.includes(mi) && mi !== total - 1) {
+      target = Math.min(target + 2, HIGH);
+    }
+
+    // γ: 問いと答えの構造（フレーズ末のみ）
+    const isQuestion   = phraseIdx % 2 === 0;
+    const isPhraseLast = role === 'resolve';
+    if (isPhraseLast && mi !== total - 1) {
+      target = isQuestion ? MID + 3 : LOW + 1;
+    }
+    if (mi === total - 1) target = LOW + 1;
+
+    targets.push(Math.max(lo, Math.min(hi, target)));
+  }
+
+  // 問い/答え判定関数（_getPhraseContextを使う形に更新）
+  const isQuestionPhrase = (mi) => {
+    const ctx = _getPhraseContext(mi, total, { phraseBoundaries });
+    return ctx.phraseIdx % 2 === 0;
+  };
+
+  return { targets, phraseStarts, phraseBoundaries, peakMeasures, isQuestionPhrase };
+}
+
+// ---------------------------------------------------------------
+// Phase 3 ③：最近接音選択
+// ---------------------------------------------------------------
+
+function _pickNearest(pool, targetMidi, excludeMidis = []) {
+  const excSet   = new Set(excludeMidis.filter(m => m !== null && m !== undefined));
+  const filtered = pool.filter(e => !excSet.has(e.midi));
+  const src      = filtered.length > 0 ? filtered : pool;
+
+  const _rng = (typeof window !== 'undefined' && window._soloRng)
+    ? window._soloRng : Math.random;
+
+  let best = src[0];
+  let bestDist = Math.abs(src[0].midi - targetMidi);
+  for (let i = 1; i < src.length; i++) {
+    const d = Math.abs(src[i].midi - targetMidi);
+    if (d < bestDist || (d === bestDist && _rng() < 0.5)) {
+      best = src[i];
+      bestDist = d;
+    }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------
+// Phase 3 ④：音高列をリズムにはめてNoteEvent列を作る
+// ---------------------------------------------------------------
+
+function _fitToRhythm(pool, durs) {
+  const events = []; let beat = 1;
+  durs.forEach((dur, i) => {
+    const item = pool.length > 0 ? pool[i % pool.length] : null;
+    events.push(makeNoteEvent(item ? item.midi : -1, dur, beat,
+                              item ? item.role : 'rest'));
+    beat += dur;
+  });
+  return events;
+}
+
+// ---------------------------------------------------------------
+// モチーフ生成ユーティリティ
+// ---------------------------------------------------------------
+
+function _buildMotif(startMidi, intervals, scalePool) {
+  const scaleMidis = new Set(scalePool.map(e => e.midi));
+  const result = [];
+  let cur = startMidi;
+
+  intervals.forEach(interval => {
+    cur += interval;
+    if (!scaleMidis.has(cur)) {
+      // スケール吸着: ±2半音以内で探す（遠すぎる吸着を防ぐ）
+      const nearby = scalePool.filter(e => Math.abs(e.midi - cur) <= 2);
+      const snap = (nearby.length > 0 ? nearby : scalePool).reduce((best, e) =>
+        Math.abs(e.midi - cur) < Math.abs(best.midi - cur) ? e : best
+      , scalePool[0]);
+      cur = snap.midi;
+    }
+    const found = scalePool.find(e => e.midi === cur);
+    result.push(found ?? { midi: cur, role: 'passing' });
+  });
+
+  return result;
+}
+
+function _clipMotifToRange(notes, lo, hi, scalePool) {
+  return notes.map(e => {
+    if (e.midi >= lo && e.midi <= hi) return e;
+    let adjusted = e.midi;
+    while (adjusted < lo)  adjusted += 12;
+    while (adjusted > hi)  adjusted -= 12;
+    const snap = scalePool.reduce((best, s) =>
+      Math.abs(s.midi - adjusted) < Math.abs(best.midi - adjusted) ? s : best
+    , scalePool[0]);
+    return snap;
+  });
+}
+
+/**
+ * ★ β案: リズモチーフカタログ（音程列 × リズム型の統合定義）
+ *
+ * 旧来の問題:
+ *   MOTIF_CATALOG は音程インターバルのみを持ち、リズムと分離していた。
+ *   音楽理論上、モチーフは「音程パターン＋リズムパターン」の組み合わせで
+ *   初めて「覚えられる・歌えるフレーズ」になる。
+ *   （例: ベートーヴェン「運命」= 短3度下降×ターン型リズム）
+ *
+ * 新設計:
+ *   各モチーフは { intervals, rhythm, name, tags } を持つ。
+ *   intervals: 半音単位の音程列
+ *   rhythm:    各音に対応するbeat長（合計は小節の4拍を超えない範囲）
+ *              ※rhythm.lengthはintervalsより1つ多い（先頭音を含む）
+ *   tags:      使用文脈（direction, progressionType）
+ *
+ * フレーズ全体の構成:
+ *   posInPhrase=0: A モチーフを提示
+ *   posInPhrase=1: A' モチーフを変形（転置・縮小）
+ *   posInPhrase=2: B モチーフでクライマックス（より高域・密度高め）
+ *   posInPhrase=3: 解決モチーフ（長音符で終わる）
+ *
+ * モチーフのリズムが小節を超えた分は次の小節冒頭に引き継がれるため
+ * 「小節をまたぐフレーズ感」が自然に生まれる。
+ */
+const RHYTHMIC_MOTIF_CATALOG = [
+  // ── 上昇系 ─────────────────────────────────────────────
+  {
+    name: 'rise_quarter',
+    intervals: [2, 2, 1],           // 全全半（Cなら C-D-E-F）
+    rhythm:    [1, 1, 1, 1],        // 四分×4（合計4拍）
+    tags: ['up', 'arch', 'folk', 'pop'],
+  },
+  {
+    name: 'rise_sync',
+    intervals: [2, 3, 2],           // ペンタ上昇
+    rhythm:    [0.5, 0.5, 1, 2],    // 8分8分四分二分（タタタン〜）
+    tags: ['up', 'arch', 'pop', 'ballad'],
+  },
+  {
+    name: 'rise_skip_long',
+    intervals: [4, 1, 2],           // 3度跳躍→ステップ
+    rhythm:    [0.5, 1, 0.5, 2],    // タン・タ・タン〜
+    tags: ['up', 'arch', 'jazz', 'pop'],
+  },
+  {
+    name: 'rise_leap_return',
+    intervals: [7, -2, -2],         // 5度跳躍→2度下降×2
+    rhythm:    [0.5, 0.5, 1, 2],    // 跳躍後に戻る（山型）
+    tags: ['arch', 'ballad'],
+  },
+  // ── 下降系 ─────────────────────────────────────────────
+  {
+    name: 'fall_quarter',
+    intervals: [-2, -2, -1],        // 全全半 下降
+    rhythm:    [1, 1, 1, 1],        // 四分×4
+    tags: ['down', 'valley', 'ballad', 'folk'],
+  },
+  {
+    name: 'fall_cascade',
+    intervals: [-2, -1, -2, -2],   // 滝下り（スケール下降）
+    rhythm:    [0.5, 0.5, 0.5, 0.5, 2], // 8分×4 + 二分（タタタタ〜）
+    tags: ['down', 'ballad', 'jazz'],
+  },
+  {
+    name: 'fall_resolve',
+    intervals: [-3, -2],            // 3度→ステップ解決
+    rhythm:    [1, 1, 2],           // 四分四分二分
+    tags: ['down', 'valley', 'jazz', 'bossa'],
+  },
+  // ── 山形 ────────────────────────────────────────────────
+  {
+    name: 'arch_classic',
+    intervals: [2, 2, -1, -3],     // なだらか山（C-D-E-Eb-C的）
+    rhythm:    [0.5, 0.5, 1, 1, 1], // 8分8分四分四分四分
+    tags: ['arch', 'pop', 'ballad'],
+  },
+  {
+    name: 'arch_leap',
+    intervals: [5, 2, -3, -2],     // 跳躍山（ジブリ的）
+    rhythm:    [0.5, 0.5, 1, 2],   // 跳躍後に落ちる
+    tags: ['arch', 'ballad', 'folk'],
+  },
+  {
+    name: 'arch_sync',
+    intervals: [2, 3, -2, -2],     // 山型シンコペ
+    rhythm:    [0.5, 1, 0.5, 1, 1], // 裏拍強調
+    tags: ['arch', 'pop', 'rnb'],
+  },
+  // ── 谷形・問いかけ ────────────────────────────────────────
+  {
+    name: 'valley_question',
+    intervals: [-3, -2, 2, 3],     // 下降→上昇（問いかけ型）
+    rhythm:    [1, 0.5, 0.5, 2],   // 四分8分8分二分
+    tags: ['valley', 'jazz', 'bossa'],
+  },
+  {
+    name: 'valley_blues',
+    intervals: [-3, 1, 2],         // ブルーノートを経由
+    rhythm:    [0.5, 0.5, 1, 2],   // ブルースシャッフル感
+    tags: ['valley', 'blues'],
+  },
+  // ── オスティナート・繰り返し ───────────────────────────────
+  {
+    name: 'neighbor_swing',
+    intervals: [2, -2, 2],         // 隣接往復（ジャズのターン）
+    rhythm:    [0.75, 0.25, 0.75, 0.25, 1, 1], // スウィング
+    tags: ['jazz', 'bossa', 'blues'],
+  },
+  {
+    name: 'turn_classic',
+    intervals: [1, -1, -2],        // バッハのターン
+    rhythm:    [0.5, 0.5, 1, 2],
+    tags: ['arch', 'jazz', 'folk'],
+  },
+  {
+    name: 'pentatonic_run',
+    intervals: [2, 3, 2, 3],       // ペンタトニック上昇ラン
+    rhythm:    [0.5, 0.5, 0.5, 0.5, 2], // 8分×4+二分
+    tags: ['up', 'arch', 'rock', 'blues'],
+  },
+  // ── 解決型（フレーズ末用） ─────────────────────────────────
+  {
+    name: 'resolve_down',
+    intervals: [-1, -2],            // 半音→全音で解決
+    rhythm:    [0.5, 1.5, 2],       // タン〜〜
+    tags: ['resolve', 'down', 'all'],
+  },
+  {
+    name: 'resolve_up',
+    intervals: [1, -1],             // 半音上→根音解決（導音）
+    rhythm:    [0.5, 0.5, 3],       // タタ〜〜〜
+    tags: ['resolve', 'up', 'all'],
+  },
+  {
+    name: 'resolve_arch',
+    intervals: [2, -1, -2],        // 上がって解決
+    rhythm:    [0.5, 0.5, 1, 2],
+    tags: ['resolve', 'arch', 'all'],
+  },
+];
+
+/**
+ * β: フレーズ内ロール・進行タイプ・方向に最適なリズモチーフを選択する [可変フレーズ化対応]
+ *
+ * posInPhrase の絶対値依存を廃止し、role（'intro'|'develop'|'climax'|'resolve'）
+ * で分岐する。フレーズ長に関係なく正しいモチーフが選ばれる。
+ *
+ * @param {string}  direction        'arch'|'up'|'down'|'valley'
+ * @param {string}  role             'intro'|'develop'|'climax'|'resolve'
+ * @param {string}  progressionType
+ * @param {number}  phraseIdx        フレーズ番号
+ * @returns {name:string, intervals:number[], rhythm:number[]}
+ */
+function _selectRhythmicMotif(direction, role, progressionType, phraseIdx) {
+  // resolve: 専用の解決モチーフ
+  if (role === 'resolve') {
+    const resolveMotifs = RHYTHMIC_MOTIF_CATALOG.filter(m => m.tags.includes('resolve'));
+    const dirMatch = resolveMotifs.filter(m => m.tags.includes(direction));
+    const src = dirMatch.length > 0 ? dirMatch : resolveMotifs;
+    return src[phraseIdx % src.length];
+  }
+
+  const genreTag    = progressionType.replace(/\d+/g, '').replace(/_.*/, '');
+  const dirFiltered = RHYTHMIC_MOTIF_CATALOG.filter(m =>
+    m.tags.includes(direction) || m.tags.includes('arch')
+  );
+  const genreFiltered = dirFiltered.filter(m => m.tags.includes(genreTag));
+  const pool = genreFiltered.length >= 2 ? genreFiltered : dirFiltered;
+
+  // climax: 音程幅が大きいモチーフを優先
+  if (role === 'climax') {
+    const bigMotifs = pool.filter(m => Math.max(...m.intervals.map(Math.abs)) >= 3);
+    const src = bigMotifs.length > 0 ? bigMotifs : pool;
+    return src[phraseIdx % src.length];
+  }
+
+  // develop: phraseIdxに+1オフセットをかけて提示と変える
+  const offset = role === 'develop' ? 1 : 0;
+  return pool[(phraseIdx + offset) % pool.length];
+}
+
+// 旧 MOTIF_CATALOG は後方互換のため残す（アルペジオ等で参照の可能性）
+const MOTIF_CATALOG = {
+  rise_step:    [2, 2, 1],
+  rise_skip:    [4, 2, 1],
+  rise_leap:    [5, -2],
+  rise_penta:   [2, 3, 2],
+  fall_step:    [-2, -2, -1],
+  fall_skip:    [-4, -2, -1],
+  fall_resolve: [-2, -1],
+  fall_cascade: [-2, -2, -3],
+  arch_short:   [2, 3, -2, -3],
+  arch_leap:    [5, 2, -4, -3],
+  arch_gentle:  [2, 2, -1, -3],
+  valley_step:  [-2, -2, 2, 2],
+  valley_leap:  [-5, 2, 3],
+  neighbor_up:  [2, -2],
+  neighbor_down:[-2, 2],
+  turn:         [2, -1, -1],
+};
+
+/**
+ * フレーズ形状に合ったモチーフカタログキーを返す
+ */
+function _getMotifKeysForContext(direction, phaseInPhrase = 0) {
+  if (direction === 'up')    return phaseInPhrase === 0
+    ? ['rise_step', 'rise_skip', 'rise_penta']
+    : ['rise_step', 'rise_leap', 'arch_short'];
+  if (direction === 'down')  return phaseInPhrase === 0
+    ? ['fall_step', 'fall_skip', 'arch_short']
+    : ['fall_step', 'fall_resolve', 'fall_cascade'];
+  if (direction === 'valley') return phaseInPhrase === 0
+    ? ['valley_step', 'valley_leap', 'fall_step']
+    : ['rise_step', 'rise_penta', 'arch_short'];
+  return phaseInPhrase === 0
+    ? ['rise_step', 'rise_penta', 'arch_gentle', 'neighbor_up']
+    : ['fall_step', 'fall_cascade', 'arch_short', 'fall_resolve'];
+}
+
+// ---------------------------------------------------------------
+// フレーズリズム設計（Fix7）[可変フレーズ化対応]
+// ---------------------------------------------------------------
+
+function _buildMusicalRhythm(rhythm, mi, totalMeasures, direction, skeleton) {
+  const base            = RHYTHM_PATTERNS[rhythm] || RHYTHM_PATTERNS.eighth;
+  const isLastMeasure   = mi === totalMeasures - 1;
+
+  // _getPhraseContextで可変フレーズ長に対応
+  const ctx         = _getPhraseContext(mi, totalMeasures, skeleton);
+  const isResolve   = ctx.role === 'resolve' || isLastMeasure;
+
+  if (isResolve) {
+    if (rhythm === 'ballad' || rhythm === 'swing') return base;
+    if (rhythm === 'eighth') {
+      const variants = [
+        [0.5, 0.5, 0.5, 0.5, 1, 1],
+        [0.5, 0.5, 0.5, 0.5, 1.5, 0.5],
+        [0.5, 0.5, 1, 1, 1],
+        [0.5, 0.5, 0.5, 0.5, 2],
+      ];
+      return variants[ctx.phraseIdx % variants.length];
+    }
+    if (rhythm === 'quarter') return [1, 1, 2];
+    if (rhythm === 'dotted')  return [1.5, 0.5, 2];
+    if (rhythm === 'mixed')   return [0.5, 0.5, 1, 2];
+  }
+
+  return base;
+}
+
+// ---------------------------------------------------------------
+// ★ Phase α: アンティシペーション＋導音ユーティリティ（Step1新設）
+// ---------------------------------------------------------------
+
+/**
+ * α1: アンティシペーション候補を返す
+ *
+ * 「次小節のコードのルート音・3度音を、現小節の弱拍裏で先取りする」
+ * 手法。コード進行の流れをメロディが先導する最も効果的な技法。
+ *
+ * 発動条件:
+ *   - 次小節にコードチェンジがある
+ *   - 現在が弱拍（beat=3.5 / beat=4 / beat=4.5）
+ *   - 先取り音が現在音から±5半音以内（滑らかな動き）
+ *
+ * @param {number}   beat          現在の拍位置
+ * @param {number}   durSec        音符の長さ（拍）
+ * @param {string}   nextChord     次小節のコード名
+ * @param {string}   key
+ * @param {number}   prevMidi      直前の音
+ * @param {number}   melodyLow
+ * @param {number}   melodyHigh
+ * @param {string}   scaleMode
+ * @returns {Array<{midi,role}>|null}  候補リスト（なければnull）
+ */
+function _getAnticipationPool(beat, dur, nextChord, key, prevMidi, melodyLow, melodyHigh, scaleMode) {
+  if (!nextChord) return null;
+  // 弱拍（3.5拍目以降）でのみ発動
+  if (beat < 3.5) return null;
+
+  const nextStruct = getChordStructure(nextChord);
+  if (!nextStruct) return null;
+
+  // 次コードのルート・3度・5度（主要構成音）を先取り候補とする
+  const nextPool = buildScaleMidiSet(key, nextChord, melodyLow, melodyHigh, scaleMode);
+  const candidates = nextPool.filter(e => {
+    const offset = (e.midi % 12 - nextStruct.rootPc + 12) % 12;
+    // root(0), 3度(3or4), 5度(7) のみ
+    return [0, 3, 4, 7].includes(offset)
+      && Math.abs(e.midi - prevMidi) <= 5;
+  });
+
+  return candidates.length > 0 ? candidates : null;
+}
+
+/**
+ * α2: 導音解決候補を返す
+ *
+ * 「半音上または下から目標音へ解決する」導音処理。
+ * 特にV7コード上の7度音（短7度）→次コードの3度への半音解決、
+ * および導音（長7度）→根音への半音解決を強制する。
+ *
+ * 発動条件:
+ *   - 現在コードがドミナント性を持つ（V7, dim, aug）
+ *   - または現在音が次コードの構成音に半音隣接している
+ *   - 小節最後の音符（コードチェンジ直前）
+ *
+ * @param {number}   prevMidi      直前音
+ * @param {string}   currentChord
+ * @param {string}   nextChord
+ * @param {string}   key
+ * @param {number}   melodyLow
+ * @param {number}   melodyHigh
+ * @param {string}   scaleMode
+ * @returns {{midi,role}|null}
+ */
+function _getLeadingToneResolution(prevMidi, currentChord, nextChord, key, melodyLow, melodyHigh, scaleMode) {
+  if (!nextChord || !currentChord) return null;
+
+  const curStruct  = getChordStructure(currentChord);
+  const nextStruct = getChordStructure(nextChord);
+  if (!curStruct || !nextStruct) return null;
+
+  const nextPool = buildScaleMidiSet(key, nextChord, melodyLow, melodyHigh, scaleMode);
+
+  // ケース1: 現在音が次コードの構成音に半音隣接 → 半音解決
+  const halfStepTargets = nextPool.filter(e => {
+    const dist = Math.abs(e.midi - prevMidi);
+    return dist === 1 && ['root', 'stable', 'color'].includes(e.role);
+  });
+  if (halfStepTargets.length > 0) {
+    // 最も重要度の高い音（root優先）を返す
+    const sorted = halfStepTargets.sort((a, b) => {
+      const order = { root: 0, stable: 1, color: 2 };
+      return (order[a.role] ?? 9) - (order[b.role] ?? 9);
+    });
+    return sorted[0];
+  }
+
+  // ケース2: ドミナント7th上の短7度 → 次コードの3度への解決
+  // V7の短7度（rootPc+10）は次のIコードの3度（rootPc+4）へ半音解決する
+  const curPc    = prevMidi % 12;
+  const curOffset = (curPc - curStruct.rootPc + 12) % 12;
+  if (curOffset === 10 && curStruct.intervals[10] === 'tension') {
+    // 短7度 → 隣接コードトーンへ
+    const resolveTargets = nextPool.filter(e =>
+      Math.abs(e.midi - prevMidi) <= 2 &&
+      ['root', 'stable'].includes(e.role)
+    );
+    if (resolveTargets.length > 0) return resolveTargets[0];
+  }
+
+  return null;
+}
+
+/**
+ * α3: リズミックモチーフ付きのリズムパターンを生成する [可変フレーズ化対応]
+ *
+ * posInPhrase の絶対値ではなく、_getPhraseContext が返す role
+ * （'intro'|'develop'|'climax'|'resolve'）で分岐するよう変更。
+ * これにより 2小節・3小節・6小節フレーズでも正しいリズムが出る。
+ *
+ * [Lyrical] arrangeStyle === 'lyrical' の場合:
+ *   - 全役割で音数を減らし、長音符（1.5拍以上）の比率を高める
+ *   - resolve: 必ず 3拍以上の長音を含む
+ *   - develop: タイ候補を生みやすい裏拍長音パターン
+ *   - climax:  スタンダードより控えめな密度（8分連打を回避）
+ *   - intro:   1拍音符主体のゆったりパターン
+ *
+ * @param {string}  rhythm
+ * @param {number}  mi
+ * @param {number}  totalMeasures
+ * @param {string}  direction
+ * @param {string}  progressionType
+ * @param {Object}  skeleton          _buildMelodySkeleton の返り値（省略可）
+ * @param {string}  arrangeStyle      'standard'|'lyrical'（省略時='standard'）
+ * @returns {number[]}
+ */
+function _buildRhythmicMotif(rhythm, mi, totalMeasures, direction, progressionType, skeleton, arrangeStyle) {
+  const isLyrical     = arrangeStyle === 'lyrical';
+  const base          = RHYTHM_PATTERNS[rhythm] || RHYTHM_PATTERNS.eighth;
+  const isLastMeasure = mi === totalMeasures - 1;
+
+  // _getPhraseContextで役割（role）を取得
+  const ctx = _getPhraseContext(mi, totalMeasures, skeleton);
+  const { role, phraseIdx } = ctx;
+  const isResolve  = role === 'resolve' || isLastMeasure;
+  const isDevelop  = role === 'develop';
+  const isClimax   = role === 'climax';
+
+  // ── [Lyrical] 叙情モード専用リズム分岐 ──────────────────────────
+  // ただし ballad/swing/dotted は固有リズム感を持つので、
+  // それらを指定している場合は _buildMusicalRhythm に委ねて lyrical 長音化は行わない
+  if (isLyrical && rhythm !== 'ballad' && rhythm !== 'swing' && rhythm !== 'dotted') {
+    // resolve: 3拍以上の長音を必ず含む（余韻重視）
+    if (isResolve) {
+      const lyricalResolve = [
+        [1, 3],           // 1拍→付点2分音符
+        [0.5, 0.5, 3],    // 2つの8分→3拍
+        [1, 1, 2],        // 4分×2→2拍
+        [4],              // 全音符（最大の余韻）
+      ];
+      return lyricalResolve[phraseIdx % lyricalResolve.length];
+    }
+    // develop: 裏拍タイを生みやすい付点系パターン（8分連打なし）
+    if (isDevelop) {
+      const lyricalDevelop = [
+        [1.5, 0.5, 2],    // 付点4分→8分→2拍
+        [1, 1.5, 0.5, 1], // 4分→付点4分→8分→4分
+        [0.5, 1.5, 2],    // 8分→付点4分→2拍
+        [1, 0.5, 0.5, 2], // 4分→8分2つ→2拍
+      ];
+      return lyricalDevelop[phraseIdx % lyricalDevelop.length];
+    }
+    // climax: 密度を上げすぎない（最大4音）
+    if (isClimax) {
+      const lyricalClimax = [
+        [0.5, 0.5, 1, 2],     // 軽い跳躍のあと長音
+        [1, 0.5, 0.5, 1, 1],  // 付点感を残して動く
+        [0.5, 1.5, 1, 1],     // 付点跳躍→タメ
+      ];
+      return lyricalClimax[phraseIdx % lyricalClimax.length];
+    }
+    // intro: 1拍・2拍音符主体のゆったりスタート
+    const lyricalIntro = [
+      [1, 1, 2],
+      [2, 1, 1],
+      [1, 2, 1],
+      [1.5, 0.5, 2],
+    ];
+    return lyricalIntro[phraseIdx % lyricalIntro.length];
+  }
+  // ────────────────────────────────────────────────────────────────
+
+  // eighth/quarter/mixed 以外はそのまま _buildMusicalRhythm に委ねる
+  if (rhythm !== 'eighth' && rhythm !== 'quarter' && rhythm !== 'mixed') {
+    return _buildMusicalRhythm(rhythm, mi, totalMeasures, direction, skeleton);
+  }
+
+  if (rhythm === 'eighth') {
+    // resolve（フレーズ末）: 長音符でブレス感
+    if (isResolve) {
+      const endVariants = [
+        [0.5, 0.5, 0.5, 0.5, 1, 1],
+        [0.5, 0.5, 0.5, 0.5, 1.5, 0.5],
+        [0.5, 0.5, 1, 2],
+        [1, 0.5, 0.5, 2],
+      ];
+      return endVariants[phraseIdx % endVariants.length];
+    }
+
+    // develop（フレーズ中盤）: シンコペ・タメ
+    if (isDevelop) {
+      const syncVariants = [
+        [0.5, 1, 0.5, 0.5, 1, 0.5],
+        [0.5, 0.5, 1, 0.5, 0.5, 1],
+        [1, 0.5, 0.5, 1, 0.5, 0.5],
+        [0.5, 0.5, 0.5, 1.5, 1],
+      ];
+      return syncVariants[phraseIdx % syncVariants.length];
+    }
+
+    // climax（フレーズ頂点）: 密度高め
+    if (isClimax) {
+      if (['blues', 'blues12'].includes(progressionType)) {
+        return [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+      }
+      return [0.5, 0.5, 0.5, 0.5, 1, 0.5, 0.5];
+    }
+
+    // intro（フレーズ先頭）: 基本均等
+    return base;
+  }
+
+  if (rhythm === 'quarter') {
+    if (isResolve) return [1, 1, 2];
+    if (isDevelop) return [0.5, 0.5, 1, 1, 1];
+    return base;
+  }
+
+  // mixed: 付点四分＋八分主体のパターン。フレーズ位置で変化をつける
+  // base = [1, 0.5, 0.5, 0.5, 0.5, 1]（合計4拍）
+  if (rhythm === 'mixed') {
+    if (isResolve) return [0.5, 0.5, 1, 2];           // 末尾は長音符でブレス
+    if (isDevelop) return [0.5, 1, 0.5, 1, 0.5, 0.5]; // 裏拍強調のシンコペ
+    if (isClimax)  return [0.5, 0.5, 0.5, 0.5, 1, 1]; // 前半細かく後半タメ
+    return base;                                        // intro: そのまま
+  }
+
+  return base;
+}
+
+// ---------------------------------------------------------------
+// ★ Phase L: 骨格参照型スケールメロディ生成（v3刷新版）
+//
+// v2との主な違い:
+//   L1: arcTargetを骨格テーブル(skeleton.targets[mi])から取得（グローバル設計）
+//   L2: モチーフidxをフレーズ内位置で管理（4小節またぎ）
+//   L3: beat3アンカーを廃止（骨格のtargetに従う軟らかい誘導に変更）
+//   L4: 弱拍コイントスを廃止（骨格の方向勾配に従う）
+//   L5: テンション解決はフレーズ境界でのみ行う（全コードチェンジで行わない）
+// ---------------------------------------------------------------
+
+/**
+ * @param {Measure}  measure
+ * @param {number}   mi
+ * @param {Score}    score
+ * @param {Object}   opts
+ * @param {number}   prevMidiIn
+ * @param {number}   melodyLow
+ * @param {number}   melodyHigh
+ * @param {string}   scaleMode
+ * @param {number}   prevPrevMidiIn
+ * @param {Object}   skeleton        ← v3新: _buildMelodySkeleton()の返り値
+ * @returns {{ events:NoteEvent[], lastMidi:number, lastLastMidi:number }}
+ */
+function _generateScaleMelody(measure, mi, score, opts, prevMidiIn,
+                               melodyLow  = UKULELE_MIDI_RANGE.melodyLow,
+                               melodyHigh = UKULELE_MIDI_RANGE.melodyHigh,
+                               scaleMode  = 'major',
+                               prevPrevMidiIn = -1,
+                               skeleton   = null,
+                               endingType = 'stable',
+                               arrangeStyle = 'standard') {
+  const { direction = 'arch' } = opts;
+  const totalMeasures = score.measures.length;
+  const rhythm        = opts.rhythm || 'eighth';
+  const isLyrical     = arrangeStyle === 'lyrical';
+
+  // ── リズム（α3: リズミックモチーフ対応版）[可変フレーズ化対応] ──
+  const progressionType = skeleton?._progressionType ?? 'generic';
+  const durs = _buildRhythmicMotif(rhythm, mi, totalMeasures, direction, progressionType, skeleton, arrangeStyle);
+
+  const scalePool  = buildScaleMidiSet(score.key, measure.chord, melodyLow, melodyHigh, scaleMode);
+  if (scalePool.length === 0) return { events: [], lastMidi: prevMidiIn, lastLastMidi: prevPrevMidiIn };
+
+  const chordTones = scalePool.filter(e => ['root', 'stable', 'color'].includes(e.role));
+  const st         = getChordStructure(measure.chord);
+  const rootTones  = st
+    ? scalePool.filter(e => (e.midi % 12 - st.rootPc + 12) % 12 === 0)
+    : [];
+
+  // ── L1: 骨格テーブルからtargetMidiを取得 ──
+  // skeleton が渡されていれば targets[mi] を使う
+  // なければ旧来の _globalPhraseTarget にフォールバック
+  const arcTarget = skeleton
+    ? skeleton.targets[mi]
+    : _globalPhraseTarget(mi, totalMeasures, melodyLow, melodyHigh, direction);
+
+  // ── L4: 骨格の方向勾配（前小節→今小節のtargetMidi差分）──
+  // 正=上昇志向、負=下降志向
+  const prevTarget   = skeleton ? (skeleton.targets[mi - 1] ?? arcTarget) : arcTarget;
+  const skeletonDir  = arcTarget - prevTarget; // 正=上昇, 負=下降
+
+  // 次コードの情報
+  const nextChord  = score.measures[mi + 1]?.chord;
+  const commonPcs  = nextChord ? new Set(getCommonTones(measure.chord, nextChord)) : new Set();
+  const nextStruct = nextChord ? getChordStructure(nextChord) : null;
+
+  // ── α1: アンティシペーション候補プールを事前計算 ──
+  // 小節内の各音符で beat >= 3.5 のとき参照する
+  // （毎音符ごとに計算するとコストが高いため小節単位でキャッシュ）
+  function _getAnticipationPoolForBeat(beat) {
+    return _getAnticipationPool(beat, null, nextChord, score.key,
+      prevMidi, melodyLow, melodyHigh, scaleMode);
+  }
+
+  // ── L2: フレーズ内位置 [可変フレーズ化対応] ──
+  // _getPhraseContextが skeleton.phraseBoundaries を参照して可変長フレーズに対応する
+  const pCtx         = _getPhraseContext(mi, totalMeasures, skeleton);
+  const posInPhrase  = pCtx.posInPhrase;
+  const phraseIdx    = pCtx.phraseIdx;
+  const phraseRole   = pCtx.role; // 'intro'|'develop'|'climax'|'resolve'
+
+  // ── γ: 問いと答えの判定 ──
+  const isQuestion = skeleton?.isQuestionPhrase
+    ? skeleton.isQuestionPhrase(mi)
+    : (phraseIdx % 2 === 0);
+  const isPhraseFinalMeasure = phraseRole === 'resolve';
+
+  // ── β: リズモチーフ選択（roleベース）──
+  const rMotif = _selectRhythmicMotif(direction, phraseRole, progressionType, phraseIdx);
+
+  // リズモチーフのリズム配列を4拍に正規化
+  const rMotifDurs = (() => {
+    const raw = [...rMotif.rhythm];
+    const total = raw.reduce((s, d) => s + d, 0);
+    if (Math.abs(total - 4) < 0.01) return raw;
+    if (total > 4) {
+      let acc = 0; const cut = [];
+      for (const d of raw) {
+        if (acc + d <= 4 + 0.01) { cut.push(d); acc += d; }
+        else { cut.push(+(4 - acc).toFixed(4)); break; }
+      }
+      return cut;
+    }
+    const adj = [...raw];
+    adj[adj.length - 1] += 4 - total;
+    return adj;
+  })();
+
+  // リズモチーフの音程列からスケール吸着済み音列を生成
+  const rMotifNotes = _clipMotifToRange(
+    _buildMotif(prevMidiIn, rMotif.intervals, scalePool),
+    melodyLow, melodyHigh, scalePool
+  );
+
+  const events  = [];
+  let   beat    = 1;
+  let   prevMidi     = prevMidiIn;
+  let   prevPrevMidi = prevPrevMidiIn;
+  let   rMotifNoteIdx = 0; // rMotifNotes への参照（先頭音=prevMidiIn, 以降は rMotifNotes）
+  let   lastDirection = 0;
+
+  rMotifDurs.forEach((dur, i) => {
+    const isFirst       = i === 0;
+    const isLast        = i === rMotifDurs.length - 1;
+    const isLastMeasure = mi === totalMeasures - 1;
+
+    const excludeList = [prevMidi, prevPrevMidi].filter(m => m > 0);
+
+    let chosen;
+
+    // ── 最終小節の最終音: endingTypeに応じて終止形を選択 [P1-8] ──
+    if (isLast && isLastMeasure) {
+      const st = getChordStructure(measure.chord);
+      const keyDef = KEY_DEFS?.find(d => d.key === score.key);
+      const ki = keyDef ? keyDef.idx : 0;
+
+      if (endingType === 'third') {
+        // 3度終止: コードの3度音（長3度 or 短3度）に着地
+        const thirdOffset = st ? Object.keys(st.intervals).map(Number).find(s => s === 3 || s === 4) : null;
+        const thirdPc = thirdOffset != null ? (st.rootPc + thirdOffset) % 12 : null;
+        const thirdTones = thirdPc != null
+          ? scalePool.filter(e => e.midi % 12 === thirdPc)
+          : [];
+        chosen = thirdTones.length > 0
+          ? _pickNearest(thirdTones, prevMidi, excludeList)
+          : _pickNearest(rootTones.length > 0 ? rootTones : chordTones, prevMidi, excludeList);
+
+      } else if (endingType === 'open') {
+        // 余韻終止: スケール上の2度・6度・9度など「未解決だが不安ではない」音
+        const openOffsets = new Set([2, 4, 9]); // 長2度、長3度、長6度
+        const openTones = scalePool.filter(e => {
+          const offset = (e.midi % 12 - ki + 12) % 12;
+          return openOffsets.has(offset);
+        });
+        chosen = openTones.length > 0
+          ? _pickNearest(openTones, prevMidi + 1, excludeList) // 少し上に浮かせる
+          : _pickNearest(chordTones, prevMidi, excludeList);
+
+      } else if (endingType === 'jazz') {
+        // ジャズ終止: 9th・maj7・13thなどのテンション音に着地
+        // オフセットはキーからの半音数（%12）: 2=長9th, 9=長13th, 11=maj7度
+        const jazzOffsets = new Set([2, 9, 11]); // 9th, 13th, maj7
+        const jazzTones = scalePool.filter(e => {
+          const offset = (e.midi % 12 - ki + 12) % 12;
+          return jazzOffsets.has(offset) || e.role === 'tension';
+        });
+        chosen = jazzTones.length > 0
+          ? _pickNearest(jazzTones, prevMidi, excludeList)
+          : _pickNearest(chordTones, prevMidi, excludeList);
+
+      } else {
+        // 'stable'（デフォルト）: 従来どおりルートに最近接
+        const src = rootTones.length > 0 ? rootTones : chordTones;
+        chosen = _pickNearest(src, prevMidi, excludeList);
+      }
+
+    // ── γ: フレーズ末尾の「問い/答え」処理 ──
+    // isPhraseFinalMeasure かつ isLast の音符がフレーズ最後の音
+    } else if (isLast && isPhraseFinalMeasure && nextChord) {
+      if (isQuestion) {
+        // 問いフレーズ末尾: スケール音の中でルート以外・やや高め → 「未解決・宙吊り感」
+        // 理想: スケールの2度・3度・6度・7度（導音感のある音）
+        const questionEndPcs = new Set([2, 4, 9, 11]); // 全音上/3度/6度/7度
+        const keyDef = KEY_DEFS?.find(d => d.key === score.key);
+        const ki = keyDef ? keyDef.idx : 0;
+        const questionCandidates = scalePool.filter(e => {
+          const offset = (e.midi % 12 - ki + 12) % 12;
+          return questionEndPcs.has(offset) && e.midi > prevMidi - 3; // 急下降しない
+        });
+        if (questionCandidates.length > 0) {
+          chosen = _pickNearest(questionCandidates, arcTarget + 2, excludeList);
+        } else {
+          // フォールバック: パッシング音で終わる
+          const passing = scalePool.filter(e => e.role === 'passing' || e.role === 'color');
+          chosen = _pickNearest(passing.length > 0 ? passing : scalePool, arcTarget, excludeList);
+        }
+      } else {
+        // 答えフレーズ末尾: ルート音またはコードトーン → 「解決・着地感」
+        const src = rootTones.length > 0 ? rootTones : chordTones;
+        chosen = _pickNearest(src, melodyLow + 2, excludeList); // 低め安定域に着地
+      }
+
+    // ── α2: 導音解決（フレーズ末以外のコードチェンジ直前） ──
+    } else if (isLast && nextChord) {
+      const leadTone = _getLeadingToneResolution(
+        prevMidi, measure.chord, nextChord, score.key,
+        melodyLow, melodyHigh, scaleMode
+      );
+      if (leadTone) {
+        chosen = leadTone;
+      } else {
+        // 通常のコードチェンジ直前: 次コードのルート付近へ誘導
+        const nextPool = buildScaleMidiSet(score.key, nextChord, melodyLow, melodyHigh, scaleMode);
+        const bridge   = nextPool.filter(e =>
+          Math.abs(e.midi - prevMidi) <= 3 &&
+          ['root', 'stable'].includes(e.role)
+        );
+        chosen = bridge.length > 0
+          ? _pickNearest(bridge, arcTarget, excludeList)
+          : _pickNearest(chordTones.length > 0 ? chordTones : scalePool, arcTarget, excludeList);
+      }
+
+    // ── 小節頭 (isFirst): リズモチーフの先頭音 → コードトーン優先でスナップ ──
+    } else if (isFirst) {
+      // [Lyrical] 長音符（1.5拍以上）の小節頭では 9th/maj7 などのテンション音を積極採用
+      // フレーズ climax/develop のときに限り発動（intro/resolve はコードトーン安定重視）
+      if (isLyrical && dur >= 1.5 && (phraseRole === 'climax' || phraseRole === 'develop')) {
+        const keyDef  = KEY_DEFS?.find(d => d.key === score.key);
+        const ki      = keyDef ? keyDef.idx : 0;
+        // 9th(2), maj7(11), 13th(9) のオフセット（キーからの半音数 %12）
+        const tensionPcs = new Set([2, 9, 11]);
+        const tensionTones = scalePool.filter(e => {
+          const offset = (e.midi % 12 - ki + 12) % 12;
+          return tensionPcs.has(offset) && Math.abs(e.midi - prevMidi) <= 5;
+        });
+        if (tensionTones.length > 0) {
+          chosen = _pickNearest(tensionTones, arcTarget, excludeList);
+        }
+      }
+      // テンション候補がなければ通常のコードトーン選択へ
+      if (!chosen) {
+        if (rMotifNotes.length > 0) {
+          const motifFirst = rMotifNotes[0];
+          const snapSrc = chordTones.filter(e => Math.abs(e.midi - motifFirst.midi) <= 5);
+          chosen = snapSrc.length > 0
+            ? _pickNearest(snapSrc, arcTarget, excludeList)
+            : _pickNearest(chordTones.length > 0 ? chordTones : scalePool, arcTarget, excludeList);
+          rMotifNoteIdx = 1;
+        } else {
+          chosen = _pickNearest(chordTones.length > 0 ? chordTones : scalePool, arcTarget, excludeList);
+        }
+      }
+
+    // ── beat3: 骨格targetに向かう（アンティシペーション優先） ──
+    } else if (getBeatStrength(beat) === 'medium') {
+      const antiPool = _getAnticipationPoolForBeat(beat);
+      if (antiPool && antiPool.length > 0) {
+        chosen = _pickNearest(antiPool, arcTarget, excludeList);
+      } else {
+        const nearTarget = scalePool.filter(e => Math.abs(e.midi - arcTarget) <= 4);
+        const src = nearTarget.length > 0 ? nearTarget : scalePool;
+        chosen = _pickNearest(src, arcTarget, excludeList);
+      }
+
+    // ── α1: 弱拍裏（beat=3.5以降）のアンティシペーション ──
+    } else if (beat >= 3.5 && nextChord) {
+      const antiPool = _getAnticipationPoolForBeat(beat);
+      if (antiPool && antiPool.length > 0) {
+        chosen = _pickNearest(antiPool, arcTarget, excludeList);
+      }
+      // アンティシペーションしない場合はリズモチーフ/ステップへfall-through
+
+    // ── リズモチーフ音が残っている: リズモチーフに従う ──
+    }
+    if (!chosen && rMotifNoteIdx < rMotifNotes.length) {
+      const motifNote = rMotifNotes[rMotifNoteIdx];
+      rMotifNoteIdx++;
+
+      // 跳躍後の逆行（4半音以上の跳躍は反対方向へ戻す）
+      if (Math.abs(lastDirection) > 0 && Math.abs(motifNote.midi - prevMidi) > 4) {
+        const oppositeDir = lastDirection > 0 ? -1 : 1;
+        const backCandidates = scalePool.filter(e => {
+          const diff = e.midi - prevMidi;
+          return Math.sign(diff) === oppositeDir && Math.abs(diff) <= 4;
+        });
+        if (backCandidates.length > 0) {
+          chosen = _pickNearest(backCandidates, prevMidi + oppositeDir * 2, excludeList);
+        }
+      }
+      if (!chosen) {
+        const inRange = motifNote.midi >= melodyLow && motifNote.midi <= melodyHigh;
+        if (inRange) {
+          const nearby = scalePool.filter(e =>
+            Math.abs(e.midi - motifNote.midi) <= 2 &&
+            !excludeList.includes(e.midi)
+          );
+          chosen = nearby.length > 0
+            ? _pickNearest(nearby, motifNote.midi, excludeList)
+            : motifNote;
+        }
+      }
+      if (!chosen) chosen = _pickNearest(scalePool, arcTarget, excludeList);
+
+    // ── その他（弱拍）: 骨格方向性に従うステップ進行 ──
+    }
+    if (!chosen) {
+      const stepRange = scalePool.filter(e =>
+        Math.abs(e.midi - prevMidi) >= 1 &&
+        Math.abs(e.midi - prevMidi) <= 3
+      );
+      const stepSrc = stepRange.length > 0 ? stepRange : scalePool;
+
+      let directional = [];
+      if (Math.abs(skeletonDir) >= 1) {
+        const up = skeletonDir > 0;
+        directional = stepSrc.filter(e =>
+          (up ? e.midi > prevMidi : e.midi < prevMidi) &&
+          !excludeList.includes(e.midi)
+        );
+      }
+      const src = directional.length > 0 ? directional : stepSrc;
+      chosen = _pickNearest(src, arcTarget, excludeList);
+    }
+
+    // null安全チェック
+    if (!chosen) chosen = _pickNearest(scalePool, arcTarget, excludeList);
+
+    // 音域クリッピング
+    if (chosen.midi < melodyLow || chosen.midi > melodyHigh) {
+      const clipped = scalePool.filter(e => e.midi >= melodyLow && e.midi <= melodyHigh);
+      if (clipped.length > 0) {
+        chosen = _pickNearest(clipped, arcTarget, excludeList);
+      }
+    }
+
+    // 方向を記録（Fix3用）
+    if (events.length > 0) {
+      lastDirection = chosen.midi > prevMidi ? 1 : chosen.midi < prevMidi ? -1 : lastDirection;
+    }
+
+    // ── emphasis 計算 ──
+    // 3層の強調を掛け合わせてメロディの輪郭を作る
+    //
+    // 層1: 拍の強弱（強拍=1.2、弱拍=0.85）
+    //      → ビートの刻みがはっきりする
+    // 層2: フレーズ頂点小節（skeleton.peakMeasures に含まれる小節）
+    //      × 小節内で arcTarget に最も近い音符 → 1.25倍
+    //      → 山の頂点が音量的に際立つ
+    // 層3: コードトーンの音楽的重要度
+    //      root=1.1、stable=1.0、color/passing=0.9
+    const beatStrength = getBeatStrength(beat, measure.beatsPerBar || 4);
+    const beatEmp = beatStrength === 'strong'  ? 1.20
+                  : beatStrength === 'medium'  ? 1.05
+                  : beatStrength === 'offbeat' ? 0.85
+                  : 0.90; // weak
+
+    const isPeakMeasure = skeleton?.peakMeasures?.includes(mi) ?? false;
+    const distToTarget  = Math.abs(chosen.midi - arcTarget);
+    // フレーズ頂点小節で arcTarget から2半音以内の音符を「頂点音」とみなす
+    const isPeakNote    = isPeakMeasure && distToTarget <= 2;
+    const peakEmp       = isPeakNote ? 1.25 : 1.0;
+
+    const roleEmp = chosen.role === 'root'    ? 1.10
+                  : chosen.role === 'stable'  ? 1.00
+                  : chosen.role === 'color'   ? 0.95
+                  : 0.90; // passing/tension
+
+    const emphasis = Math.min(beatEmp * peakEmp * roleEmp, 1.5); // 上限1.5
+
+    const ev = makeNoteEvent(chosen.midi, dur, beat, chosen.role);
+    ev.emphasis = emphasis; // NoteEvent に emphasis を付与
+
+    // ── [Lyrical] tieOut / sustainHint 付与 ──
+    // tieOut: フレーズ末尾またはコードチェンジ直前の最終音を対象に
+    //         35〜55% の確率でタイを設定（乱用防止: 同フレーズ内連続2回まで）
+    if (isLyrical && isLast && nextChord) {
+      const rng = window._soloRng ?? Math.random;
+      const tieProb = (isPhraseFinalMeasure) ? 0.55 : 0.35;
+      if (rng() < tieProb) {
+        ev.tieOut = true;
+      }
+    }
+    // sustainHint: 1.5拍以上の音符（または叙情モードの強拍長音）を余韻重視マーク
+    if (isLyrical && dur >= 1.5) {
+      ev.sustainHint = true;
+    }
+    // テンション音の長音: 叙情モードでは9th/maj7などのcolor/tension音を
+    // フレーズ要所（climax/resolve）で長音として配置しやすくする
+    if (isLyrical && dur >= 1.0 && (chosen.role === 'color' || chosen.role === 'tension')) {
+      ev.sustainHint = true;
+    }
+
+    events.push(ev);
+    prevPrevMidi = prevMidi;
+    prevMidi     = chosen.midi;
+    beat        += dur;
+  });
+
+  return { events, lastMidi: prevMidi, lastLastMidi: prevPrevMidi };
+}
+
+// ---------------------------------------------------------------
+// Phase 3 ⑥：Level 1 アルペジオ生成
+// ---------------------------------------------------------------
+
+function _generateArpeggio(measure, mi, score, opts,
+                            melodyLow  = UKULELE_MIDI_RANGE.melodyLow,
+                            melodyHigh = UKULELE_MIDI_RANGE.melodyHigh,
+                            skeleton   = null) {
+  const { rhythm = 'eighth', direction = 'arch' } = opts;
+  const durs = RHYTHM_PATTERNS[rhythm] || RHYTHM_PATTERNS.eighth;
+
+  const total = score.measures.length;
+  // [BugC] skeleton が渡されていれば targets[mi] を使う（可変フレーズ骨格に準拠）
+  const targetMidi = (skeleton && skeleton.targets?.[mi] != null)
+    ? skeleton.targets[mi]
+    : _globalPhraseTarget(mi, total, melodyLow, melodyHigh, direction);
+
+  const pool = buildChordMidiSet(measure.chord, score.key, melodyLow, melodyHigh);
+  if (pool.length === 0) return [];
+
+  const STRING_ORDER_ASC = [1, 2, 0, 3]; // C→E→G→A
+  const byString = [];
+  STRING_ORDER_ASC.forEach(si => {
+    const open = [67, 60, 64, 69][si];
+    for (let f = 0; f <= 12; f++) {
+      const found = pool.find(e => e.midi === open + f);
+      if (found) { byString.push({ ...found, stringIdx: si, fret: f }); break; }
+    }
+  });
+  if (byString.length === 0) return _fitToRhythm(_contourByMidi(pool, direction), durs);
+
+  // targetMidi に最も近い音から始まるよう並び替え
+  const sorted = [...byString].sort((a, b) =>
+    Math.abs(a.midi - targetMidi) - Math.abs(b.midi - targetMidi)
+  );
+  const pivot = sorted[0];
+
+  let ordered;
+  if (direction === 'down') {
+    ordered = [...byString].sort((a, b) => b.midi - a.midi);
+  } else if (direction === 'up') {
+    ordered = [...byString].sort((a, b) => a.midi - b.midi);
+  } else if (direction === 'valley') {
+    const asc = [...byString].sort((a, b) => a.midi - b.midi);
+    const mid = Math.floor(asc.length / 2);
+    ordered = [...asc.slice(0, mid).reverse(), ...asc.slice(mid)];
+  } else {
+    // arch: pivotを頂点に、前後から上昇して戻る
+    const below = byString.filter(e => e.midi <= pivot.midi).sort((a, b) => a.midi - b.midi);
+    const above = byString.filter(e => e.midi > pivot.midi).sort((a, b) => a.midi - b.midi);
+    ordered = [...below, ...above, ...[...above].reverse()];
+  }
+
+  const events = []; let beat = 1;
+  durs.forEach((dur, i) => {
+    const item = ordered[i % ordered.length];
+    events.push(makeNoteEvent(item.midi, dur, beat, item.role));
+    beat += dur;
+  });
+  return events;
+}
+
+// ---------------------------------------------------------------
+// 旧来の _globalPhraseTarget（骨格なし時のフォールバック用）
+// ---------------------------------------------------------------
+
+function _globalPhraseTarget(mi, total, lo = 60, hi = 76, shape = 'arch') {
+  const p = mi / Math.max(total - 1, 1);
+  let t;
+  if (shape === 'arch')        t = 4 * p * (1 - p);
+  else if (shape === 'up')     t = p;
+  else if (shape === 'down')   t = 1 - p;
+  else if (shape === 'valley') t = 1 - 4 * p * (1 - p);
+  else                         t = 4 * p * (1 - p);
+  return Math.round(lo + t * (hi - lo));
+}
+
+function _contourByMidi(pool, direction) {
+  const asc  = [...pool].sort((a, b) => a.midi - b.midi);
+  const desc = [...pool].sort((a, b) => b.midi - a.midi);
+  if (direction === 'up')    return asc;
+  if (direction === 'down')  return desc;
+  if (direction === 'valley') {
+    if (desc.length < 2) return desc;
+    const mid = Math.ceil(desc.length / 2);
+    return [...desc.slice(0, mid), ...desc.slice(mid).reverse()];
+  }
+  if (asc.length < 2) return asc;
+  const mid = Math.ceil(asc.length / 2);
+  return [...asc.slice(0, mid), ...asc.slice(mid).reverse()];
+}
+
+// ---------------------------------------------------------------
+// ★ Phase 3 ⑦：generateMelody（v3メインAPI）
+//
+// v3変更点:
+//   style='melody' のとき、ループ前に全体骨格を先に計算し、
+//   各小節の生成に skeleton を渡す。
+//   コードを1つ追加・変更するたびに骨格が再計算される。
+// ---------------------------------------------------------------
+
+function generateMelody(score, options = {}) {
+  const {
+    style      = 'chord',
+    melodyLow  = UKULELE_MIDI_RANGE.melodyLow,
+    melodyHigh = UKULELE_MIDI_RANGE.melodyHigh,
+    scaleMode  = 'major',
+    endingType = 'stable',  // [P1-8] 'stable'|'third'|'open'|'jazz'
+    arrangeStyle = 'standard', // [Lyrical] 'standard'|'lyrical'
+  } = options;
+
+  if (style === 'melody') {
+
+    // ── ★ Phase G: 全体骨格を先に計算 [可変フレーズ化対応] ──
+    const chordNames  = score.measures.map(m => m.chord);
+    const progression = _classifyProgression(chordNames, score.key);
+    const form        = options.direction ?? progression.form;
+
+    // [可変フレーズ化] コード進行からフレーズ長を自動推定
+    // options.phraseLens が明示指定されていればそちらを優先
+    const phraseLens = options.phraseLens
+      ?? _estimatePhraseLen(chordNames, score.key);
+
+    // テンション小節: 各フレーズの climax 相当位置（フレーズ長の60〜80%付近）
+    const tensionMiArr = [];
+    let cur = 0;
+    for (const pl of phraseLens) {
+      const climaxOffset = Math.max(0, Math.floor(pl * 0.6) - 1);
+      tensionMiArr.push(cur + climaxOffset);
+      cur += pl;
+    }
+
+    const skeleton = _buildMelodySkeleton(
+      form,
+      score.measures.length,
+      melodyLow,
+      melodyHigh,
+      tensionMiArr,
+      phraseLens   // [可変フレーズ化] フレーズ長配列を渡す
+    );
+    // 進行タイプをskeletonに付与してリズミックモチーフ選択に使う
+    skeleton._progressionType = progression.type;
+
+    // 開始音: 骨格の最初のターゲットに最も近いコードトーンを選ぶ
+    const _startPool = buildScaleMidiSet(score.key, score.measures[0]?.chord,
+                                         melodyLow, melodyHigh, scaleMode);
+    const _startTones = _startPool.filter(e => ['root','stable'].includes(e.role));
+    const _startSrc   = _startTones.length > 0 ? _startTones : _startPool;
+    const _bestStart  = _startSrc.length > 0
+      ? _startSrc.reduce((best, e) =>
+          Math.abs(e.midi - skeleton.targets[0]) < Math.abs(best.midi - skeleton.targets[0]) ? e : best,
+          _startSrc[0])
+      : { midi: skeleton.targets[0] };
+    let prevMidi     = Math.min(Math.max(_bestStart.midi, melodyLow), melodyHigh - 2);
+    let prevPrevMidi = -1;
+
+    score.measures.forEach((measure, mi) => {
+      const result = _generateScaleMelody(
+        measure, mi, score, options, prevMidi,
+        melodyLow, melodyHigh, scaleMode, prevPrevMidi,
+        skeleton,    // ← v3: 全体骨格を渡す
+        endingType,  // [P1-8] 終止タイプ
+        arrangeStyle // [Lyrical] アレンジスタイル
+      );
+      measure.melody = result.events;
+      prevPrevMidi   = result.lastLastMidi;
+      prevMidi       = result.lastMidi;
+    });
+
+  } else {
+    // arpeggio / chord のとき骨格を先に計算して渡す [BugF]
+    const chordNames  = score.measures.map(m => m.chord);
+    const progression = _classifyProgression(chordNames, score.key);
+    const form        = options.direction ?? progression.form;
+    const phraseLens  = options.phraseLens ?? _estimatePhraseLen(chordNames, score.key);
+    const arpeggioSkeleton = _buildMelodySkeleton(
+      form, score.measures.length, melodyLow, melodyHigh, [], phraseLens
+    );
+
+    score.measures.forEach((measure, mi) => {
+      if (style === 'chord') {
+        measure.melody = [];
+      } else if (style === 'arpeggio') {
+        measure.melody = _generateArpeggio(
+          measure, mi, score, options, melodyLow, melodyHigh, arpeggioSkeleton
+        );
+      }
+    });
+  }
+
+  return score;
+}
+
+// ---------------------------------------------------------------
+// Phase 4：フレット解決 ＋ 奏法付与
+// ---------------------------------------------------------------
+
+function resolveFingerPositions(score) {
+  let prevSi   = 2;
+  let prevFret = -1;
+
+  score.measures.forEach(m => {
+    m.melody.forEach(ev => {
+      if (ev.type === 'rest') return;
+
+      // ★ L4修正: maxFret超過時にreturnせずオクターブ補正で継続
+      let opts = midiToFretOptions(ev.midi);
+      if (opts.length === 0) {
+        // どの弦にも乗らない場合: オクターブ下げて再試行
+        const altMidi = ev.midi - 12;
+        opts = midiToFretOptions(altMidi);
+        if (opts.length > 0) ev.midi = altMidi;
+        else return; // それでもダメなら本当にスキップ
+      }
+
+      // ★ L5修正: preferredStrings を全弦に拡張（C/G弦含む）
+      // コスト計算: 弦移動コスト×2 + フレット移動コスト
+      const best = opts.reduce((b, o) => {
+        const cost = Math.abs(o.stringIdx - prevSi) * 2
+                   + Math.abs(o.fret - prevFret);
+        return cost < b.cost ? { ...o, cost } : b;
+      }, { ...opts[0], cost: Infinity });
+
+      ev.stringIdx = best.stringIdx;
+      ev.fret      = best.fret;
+      ev.technique = assignTechnique(prevSi, prevFret, best.stringIdx, best.fret);
+
+      prevSi   = best.stringIdx;
+      prevFret = best.fret;
+    });
+  });
+  return score;
+}
+
+// ---------------------------------------------------------------
+// パブリックAPI
+// ---------------------------------------------------------------
+
+function buildScoreFromChords(chordNames, key, options = {}) {
+  const { style, genre } = options;
+  const preset = genre ? (GENRE_PRESETS?.[genre] ?? null) : null;
+
+  const resolvedRhythm    = preset?.rhythm     ?? options.rhythm     ?? 'eighth';
+  const resolvedDirection = preset?.direction  ?? options.direction  ?? 'arch';
+  const resolvedMelodyLow = preset?.melodyLow  ?? UKULELE_MIDI_RANGE.melodyLow;
+  const resolvedMelodyHigh= preset?.melodyHigh ?? UKULELE_MIDI_RANGE.melodyHigh;
+  const resolvedScaleMode = preset?.scaleMode  ?? options.scaleMode  ?? 'major';
+
+  let score = makeScore(key, chordNames, style ?? 'chord', genre ?? null);
+  score = generateMelody(score, {
+    style,
+    rhythm:       resolvedRhythm,
+    direction:    resolvedDirection,
+    melodyLow:    resolvedMelodyLow,
+    melodyHigh:   resolvedMelodyHigh,
+    scaleMode:    resolvedScaleMode,
+    endingType:   options.endingType   ?? 'stable',   // [BugA] P1-8 終止タイプを転送
+    phraseLens:   options.phraseLens   ?? null,        // [BugA] 可変フレーズ長を転送
+    arrangeStyle: options.arrangeStyle ?? 'standard', // [Lyrical] アレンジスタイルを転送
+  });
+  score = resolveFingerPositions(score);
+  return score;
+}
+
+// ---------------------------------------------------------------
+// Phase 5b: ストロークスコア生成
+// ---------------------------------------------------------------
+
+function buildStrokeScore(chordNames, key, options = {}) {
+  const { genre, beatPattern, arrangeStyle = 'standard' } = options;
+  const preset = genre ? (GENRE_PRESETS?.[genre] ?? null) : null;
+
+  const patternKey = beatPattern ?? preset?.beatPattern ?? 'eight_beat';
+  const pattern = BEAT_PATTERNS?.[patternKey] ?? BEAT_PATTERNS.eight_beat;
+  const tempo   = preset?.tempo ?? 100;
+
+  const measures = chordNames.map((chord, i) => {
+    const candidates = getChordCandidates(chord, key, 'low');
+    const frets = candidates.length > 0 ? candidates[0].frets : [0,0,0,0];
+
+    const strokes = pattern.map(p => ({
+      type:      'stroke',
+      beat:      p.beat,
+      duration:  p.dur,
+      direction: p.dir,
+      technique: p.tech,
+      velocity:  1.0,
+      chord,
+      frets,
+    }));
+
+    // [FA-2] strokeモードにもアルペジオ内声を追加（ジャンル指定時）
+    const innerVoice = genre
+      ? _buildFullArpeggioInner({ chord, chordFrets: frets, strokes }, key, genre, arrangeStyle)
+      : [];
+
+    return {
+      number:      i + 1,
+      chord,
+      chordFrets:  frets,
+      strokes,
+      innerVoice,
+      melody:      [],
+      beatsPerBar: 4,
+    };
+  });
+
+  return {
+    key,
+    tempo,
+    timeSignature: [4, 4],
+    style:   'stroke',
+    genre:   genre ?? null,
+    measures,
+  };
+}
+
+// ---------------------------------------------------------------
+// Phase 5c: フルアレンジ補助関数群
+// ---------------------------------------------------------------
+
+/**
+ * [FA-1] ジャンル別アルペジオ内声パターン定義
+ *
+ * ソロモード(SOLO_GENRE_TECHNIQUES)と対応させつつ、
+ * フルアレンジの「コードストローク + 旋律」文脈に合わせて
+ * 各弦をはじく beat を定義する。
+ *
+ * 構造: { beats: [beat値...], strings: [si...] }
+ *   si: 0=G弦, 1=C弦, 2=E弦, 3=A弦
+ *   beat値はストローク拍の「隙間」を埋めるように設計する
+ */
+const FULL_ARPEGGIO_PATTERNS = {
+  // ボサノバ: 親指ベース(1拍)→内声アルペジオ(1.5, 2.5)のカスケード
+  bossa:   { beats: [1.5, 2.0, 2.5, 3.5, 4.0, 4.5], strings: [0, 2, 3, 0, 2, 3] },
+  // バラード: ゆったりした分散和音(1.5, 2, 3, 3.5)
+  ballad:  { beats: [1.5, 2.0, 3.5, 4.0],           strings: [0, 2, 1, 3] },
+  // ジャズ: コンピング的に1拍と3拍の間に内声を配置
+  jazz:    { beats: [1.5, 2.5, 3.5, 4.5],           strings: [1, 2, 1, 2] },
+  // ポップ: シンプルな8分アルペジオ
+  pop:     { beats: [1.5, 2.5, 3.5, 4.5],           strings: [0, 2, 1, 3] },
+  // フォーク: 親指ベース+人差し指のスリーフィンガー風
+  folk:    { beats: [1.5, 2.0, 3.5, 4.0],           strings: [0, 3, 0, 3] },
+  // ロック: 力強いパワーコード的アルペジオは省き、シンプルに
+  rock:    { beats: [2.0, 4.0],                      strings: [0, 1] },
+  // R&B: シンコペした裏拍アルペジオ
+  rnb:     { beats: [1.5, 2.5, 3.0, 4.5],           strings: [2, 3, 1, 3] },
+  // ハワイアン: スラック・キー風の流れるアルペジオ
+  hawaiian:{ beats: [1.5, 2.0, 2.5, 3.5, 4.0, 4.5], strings: [0, 1, 2, 0, 2, 3] },
+  // ブルース: バックビートに合わせたシンプル内声
+  blues:   { beats: [2.0, 3.0, 4.0],                strings: [1, 0, 2] },
+};
+
+/**
+ * [FA-2] フルアレンジ用アルペジオ内声イベント生成
+ *
+ * ジャンルに応じた FULL_ARPEGGIO_PATTERNS を使って、
+ * コードのフレット情報から各弦の押弦音を内声イベントとして生成する。
+ * ストロークと同じ beat は重複を避けてスキップする。
+ *
+ * @param {object}   measure      小節データ（chord, chordFrets, strokes）
+ * @param {string}   key          キー名
+ * @param {string}   genre        ジャンルキー
+ * @param {string}   arrangeStyle 'standard'|'lyrical'
+ * @returns {object[]} inner voice events
+ */
+function _buildFullArpeggioInner(measure, key, genre, arrangeStyle) {
+  const pat = FULL_ARPEGGIO_PATTERNS[genre] ?? FULL_ARPEGGIO_PATTERNS.pop;
+  const frets = measure.chordFrets ?? [0, 0, 0, 0];
+
+  // ストロークが使っている beat セット（重複回避用）
+  const strokeBeats = new Set((measure.strokes ?? []).map(s => s.beat));
+
+  // lyrical モードではアルペジオの密度を上げる
+  const beatsToUse = arrangeStyle === 'lyrical'
+    ? [...pat.beats, ...(FULL_ARPEGGIO_PATTERNS.ballad?.beats ?? [])]
+        .filter((b, i, a) => a.indexOf(b) === i).sort((a, b) => a - b)
+    : pat.beats;
+
+  return beatsToUse.map((beat, i) => {
+    // ストロークと同拍はスキップ
+    if (strokeBeats.has(beat)) return null;
+
+    const si   = pat.strings[i % pat.strings.length];
+    const fret = frets[si] ?? 0;
+    const midi = typeof fretToMidi === 'function' ? fretToMidi(si, fret) : 60;
+
+    return {
+      type:      'note',
+      beat,
+      duration:  0.5,
+      midi,
+      fret,
+      stringIdx: si,
+      voice:     'inner',
+      role:      'stable',
+      playStyle: 'arpeggio',
+      technique: 'normal',
+      emphasis:  0.7,
+    };
+  }).filter(Boolean);
+}
+
+/**
+ * [FA-3] オブリガードフィル生成
+ *
+ * オブリガード（obbligato）= コードの変わり目で主旋律を補完する
+ * 対位的な装飾フレーズ。ウクレレでは小節末尾（beat 3.5〜4.5）に
+ * 次コードへ向かう経過音を1〜3音入れるのが典型的。
+ *
+ * 生成条件:
+ *   - 小節末尾（phraseRole='develop' または 'climax' の手前）
+ *   - 主旋律の最終音と次コードのルート音の間に2半音以上の距離がある
+ *   - arrangeStyle='lyrical' またはジャンルが ballad/bossa/jazz
+ *
+ * @param {object}   measure      現在の小節
+ * @param {object}   nextMeasure  次の小節（null なら最終小節）
+ * @param {string}   key          キー名
+ * @param {string}   genre        ジャンルキー
+ * @param {string}   arrangeStyle 'standard'|'lyrical'
+ * @returns {object[]} fill events（既存 melody イベントとマージする）
+ */
+function _buildObbligatoFill(measure, nextMeasure, key, genre, arrangeStyle) {
+  // オブリガードを生成するジャンル
+  const OBBLIGATO_GENRES = new Set(['ballad', 'bossa', 'jazz', 'pop', 'rnb']);
+  const shouldGenerate   = arrangeStyle === 'lyrical'
+                        || OBBLIGATO_GENRES.has(genre ?? '');
+  if (!shouldGenerate || !nextMeasure) return [];
+
+  // 現在小節の主旋律の最終音を取得
+  const melNotes = (measure.melody ?? []).filter(e => e.type === 'note');
+  if (melNotes.length === 0) return [];
+
+  const lastNote   = melNotes[melNotes.length - 1];
+  const lastBeat   = lastNote.beat;
+  const lastMidi   = lastNote.midi;
+  const fillStart  = Math.max(lastBeat + (lastNote.duration ?? 0.5), 3.0);
+
+  // 小節末にすでに音符が詰まっている場合はスキップ
+  if (fillStart > 4.0) return [];
+
+  // 次コードのルート音を取得
+  const nextStruct = getChordStructure(nextMeasure.chord);
+  if (!nextStruct) return [];
+  const nextRootPc = nextStruct.rootPc;
+
+  // 次コードへ向かうスケール音プール（半音1〜2の経過音候補）
+  const pool = buildScaleMidiSet(key, nextMeasure.chord,
+    lastMidi - 5, lastMidi + 7, 'major');
+  if (pool.length === 0) return [];
+
+  // 方向: lastMidi → nextRoot（最短距離）
+  const targetMidi = pool.filter(e => (e.midi % 12) === nextRootPc)
+    .map(e => e.midi)
+    .sort((a, b) => Math.abs(a - lastMidi) - Math.abs(b - lastMidi))[0]
+    ?? (lastMidi + (nextRootPc > lastMidi % 12 ? 1 : -1));
+
+  const dir     = targetMidi > lastMidi ? 1 : -1;
+  const steps   = Math.min(2, Math.floor((4.5 - fillStart) / 0.5)); // 最大2音
+  if (steps <= 0) return [];
+
+  const fills = [];
+  let   cur   = lastMidi;
+  for (let s = 0; s < steps; s++) {
+    // スケール内で方向に近い次の音を探す
+    const next = pool
+      .filter(e => (dir > 0 ? e.midi > cur : e.midi < cur)
+               && Math.abs(e.midi - cur) <= 3)
+      .sort((a, b) => Math.abs(a.midi - targetMidi) - Math.abs(b.midi - targetMidi))[0];
+    if (!next) break;
+
+    const beat = fillStart + s * 0.5;
+    if (beat > 4.5) break;
+
+    fills.push({
+      type:      'note',
+      beat,
+      duration:  0.25,
+      midi:      next.midi,
+      fret:      null,   // resolveFingerPositions で後付け
+      stringIdx: 3,      // A弦優先（最高弦→オブリガードらしい音色）
+      voice:     'melody',
+      role:      'passing',
+      playStyle: 'picking',
+      technique: 'normal',
+      emphasis:  0.75,
+      _isObbligato: true, // 識別フラグ
+    });
+    cur = next.midi;
+  }
+  return fills;
+}
+
+// ---------------------------------------------------------------
+// Phase 5d: 統合スコア生成（フルアレンジ）
+// ---------------------------------------------------------------
+
+function buildIntegratedScore(chordNames, key, options = {}) {
+  const {
+    genre,
+    beatPattern,
+    arrangeStyle = 'standard', // [FA] arrangeStyleをフルアレンジ側にも伝達
+  } = options;
+  const preset = genre ? (GENRE_PRESETS?.[genre] ?? null) : null;
+
+  // [FA] arrangeStyleをメロディ生成にも伝達（lyrical時にリズム・骨格が変わる）
+  const melodyScore = buildScoreFromChords(chordNames, key, {
+    ...options,
+    style:       'melody',
+    arrangeStyle,
+  });
+
+  const patternKey = beatPattern ?? preset?.beatPattern ?? 'eight_beat';
+  const pattern    = BEAT_PATTERNS?.[patternKey] ?? BEAT_PATTERNS.eight_beat;
+
+  melodyScore.measures.forEach((m, mi) => {
+    // ── ストローク ──
+    m.strokes = pattern.map(p => ({
+      type:      'stroke',
+      beat:      p.beat,
+      duration:  p.dur,
+      direction: p.dir,
+      technique: p.tech,
+      velocity:  1.0,
+      chord:     m.chord,
+      frets:     m.chordFrets,
+    }));
+
+    // [FA-2] アルペジオ内声を追加
+    if (genre) {
+      const innerEvents = _buildFullArpeggioInner(m, key, genre, arrangeStyle);
+      m.innerVoice = innerEvents; // strokes とは別トラックに格納
+    }
+
+    // [FA-3] オブリガードフィルを主旋律の末尾に挿入
+    const nextMeasure = melodyScore.measures[mi + 1] ?? null;
+    const fills = _buildObbligatoFill(m, nextMeasure, key, genre ?? '', arrangeStyle);
+    if (fills.length > 0) {
+      // オブリガートのフレットをA弦(si=3)で解決
+      fills.forEach(f => {
+        const opts = typeof midiToFretOptions === 'function'
+          ? midiToFretOptions(f.midi).filter(o => o.stringIdx === 3)
+          : [];
+        if (opts.length > 0) {
+          f.fret      = opts[0].fret;
+          f.stringIdx = 3;
+        }
+      });
+      m.melody = [...(m.melody ?? []), ...fills];
+    }
+  });
+
+  melodyScore.style = 'integrated';
+  return melodyScore;
+}
+
+// ---------------------------------------------------------------
+// 開発用テスト関数
+// ---------------------------------------------------------------
+
+function runMelodyEngineTests() {
+  console.group('=== MelodyEngine v3 テスト ===');
+  let passed = 0, failed = 0;
+
+  function assert(label, actual, expected) {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    if (ok) { console.log(`  ✅ ${label}`); passed++; }
+    else {
+      console.warn(`  ❌ ${label}`);
+      console.warn(`     期待値: ${JSON.stringify(expected)}`);
+      console.warn(`     実際値: ${JSON.stringify(actual)}`);
+      failed++;
+    }
+  }
+  function assertOk(label, cond) {
+    if (cond) { console.log(`  ✅ ${label}`); passed++; }
+    else { console.warn(`  ❌ ${label}`); failed++; }
+  }
+
+  // ── Phase G: 進行タイプ判定 ──
+  console.group('[G1] 進行タイプ判定');
+  const prog1 = _classifyProgression(['C','G','Am','F'], 'C');
+  assertOk('王道進行(I-V-VIm-IV)判定', prog1.type === 'oh_well');
+  const prog2 = _classifyProgression(['Am','F','C','G'], 'C');
+  assertOk('小室進行(VIm-IV-I-V)判定', prog2.type === 'komuro');
+  const prog3 = _classifyProgression(['Dm','G','C','C'], 'C');
+  assertOk('II-V-I判定', prog3.type === 'two_five_one');
+  console.groupEnd();
+
+  // ── Phase G: 骨格生成 ──
+  console.group('[G2] 骨格生成');
+  const skel = _buildMelodySkeleton('arch', 8, 60, 76);
+  assertOk('骨格: 8小節分のtargetsを生成', skel.targets.length === 8);
+  assertOk('骨格: 全ターゲットが音域内', skel.targets.every(t => t >= 60 && t <= 76));
+  assertOk('骨格: 最終小節は低め（解決）', skel.targets[7] <= 64);
+  // [BugG] phraseStarts.length の固定チェックを廃止し、
+  //        可変フレーズ化後の実態に合わせた検証に変更
+  assertOk('骨格: phraseBoundaries が存在する', Array.isArray(skel.phraseBoundaries) && skel.phraseBoundaries.length > 0);
+  assertOk('骨格: phraseStarts が存在する',     Array.isArray(skel.phraseStarts)    && skel.phraseStarts.length > 0);
+  assertOk('骨格: 全フレーズ境界が総小節数を網羅',
+    skel.phraseBoundaries[skel.phraseBoundaries.length - 1].end === 7);
+  assertOk('骨格: isQuestionPhrase は関数',     typeof skel.isQuestionPhrase === 'function');
+  console.groupEnd();
+
+  // ── Phase G: コード変更時の再計算 ──
+  console.group('[G3] コード変更時の再計算確認');
+  const skel4 = _buildMelodySkeleton('arch', 4, 60, 76);
+  const skel5 = _buildMelodySkeleton('arch', 5, 60, 76); // 1コード追加
+  assertOk('4コード→5コード: targets長さが変わる', skel4.targets.length !== skel5.targets.length);
+  assertOk('5コード時に全小節分のtargetsを再計算', skel5.targets.length === 5);
+  console.groupEnd();
+
+  // ── Phase 2: getChordStructure ──
+  console.group('getChordStructure');
+  const cMaj = getChordStructure('C');
+  assert('C: rootPc=0',           cMaj?.rootPc,      0);
+  assert('C: offset 0 = root',    cMaj?.intervals[0], 'root');
+  assert('C: offset 4 = color',   cMaj?.intervals[4], 'color');
+  assert('C: offset 7 = stable',  cMaj?.intervals[7], 'stable');
+  const g7 = getChordStructure('G7');
+  assert('G7: offset 10 = tension', g7?.intervals[10], 'tension');
+  console.groupEnd();
+
+  // ── RHYTHM_PATTERNS ──
+  console.group('RHYTHM_PATTERNS（全て4拍）');
+  Object.entries(RHYTHM_PATTERNS).forEach(([k,v]) => {
+    const total = v.reduce((s,d)=>s+d,0);
+    assert(`${k}: 合計4拍`, total, 4);
+  });
+  console.groupEnd();
+
+  // ── スケールメロディ（v3骨格あり）──
+  console.group('スケールメロディ生成（v3 骨格あり）');
+  const sm = buildScoreFromChords(['C','Am','F','G'], 'C',
+    {style:'melody', rhythm:'eighth', direction:'arch'});
+  assertOk('全小節にイベントあり', sm.measures.every(m=>m.melody.length > 0));
+  assertOk('chromatic音なし', sm.measures.every(m=>m.melody.every(e=>e.role!=='chromatic')));
+
+  const allMidis = sm.measures.flatMap(m => m.melody.map(e => e.midi));
+  let hasTripleRepeat = false;
+  for (let i = 2; i < allMidis.length; i++) {
+    if (allMidis[i] === allMidis[i-1] && allMidis[i] === allMidis[i-2]) {
+      hasTripleRepeat = true; break;
+    }
+  }
+  assertOk('[Fix5] 同音3連打なし', !hasTripleRepeat);
+
+  const lastN = sm.measures.at(-1).melody.at(-1);
+  assertOk('最終音はroot', lastN?.role === 'root');
+  assertOk('弦解決済み', sm.measures.every(m=>m.melody.every(e=>e.stringIdx!==null)));
+  console.groupEnd();
+
+  // ── コード追加時の全体再設計確認 ──
+  console.group('[G] コード追加→全体再設計');
+  const sm4 = buildScoreFromChords(['C','Am','F','G'], 'C', {style:'melody'});
+  const sm5 = buildScoreFromChords(['C','Am','F','G','C'], 'C', {style:'melody'});
+  assertOk('4コード→5コード: 小節数が増加', sm5.measures.length === 5);
+  assertOk('5コード全小節にmelodyあり', sm5.measures.every(m=>m.melody.length > 0));
+  console.groupEnd();
+
+  // ── バラードリズム ──
+  console.group('バラードリズム');
+  const sb = buildScoreFromChords(['C','Am','F','G'],'C',{style:'melody',rhythm:'ballad'});
+  assertOk('ballad: 各小節に長音符あり', sb.measures.every(m => m.melody.some(e => e.duration >= 1.5)));
+  console.groupEnd();
+
+  // ── 奏法付与 ──
+  console.group('奏法付与');
+  assertOk('奏法が有効値のみ', sm.measures.every(m=>m.melody.every(e=>
+    ['normal','hammer_on','pull_off','slide','open'].includes(e.technique))));
+  console.groupEnd();
+
+  console.log(`\n結果: ${passed}件 ✅  ${failed}件 ❌`);
+  console.groupEnd();
+  return { passed, failed };
+}
+</script>

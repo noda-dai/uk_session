@@ -1,0 +1,661 @@
+<script>
+// ===================================================================
+// session_engine.txt  — SessionSpace コアエンジン
+//
+// 依存（共有ライブラリ）:
+//   js_data.txt         — KEY_DATA, getChordStructure, fretToMidi,
+//                         midiToFretOptions, CHROMATIC
+//   js_melodyEngine.txt — buildScoreFromChords, buildChordMidiSet
+//   solo_js_engine.txt  — buildSoloScore, buildBassLine,
+//                         buildInnerVoices, makeSoloEvent
+//   js_midiParser.txt   — parseMidi
+//   session_data.txt    — INSTRUMENT_PROFILES, SESSION_ROLES,
+//                         ROLE_MUTEX_GROUPS, FREQ_VIZ
+// ===================================================================
+
+// ---------------------------------------------------------------
+// ガイドトーン抽出
+// ---------------------------------------------------------------
+
+/**
+ * コード構造からガイドトーン（3度・7度）のピッチクラスを返す
+ *
+ * getChordStructure() の返却値:
+ *   { rootPc: number, intervals: { [pc]: roleName } }
+ *   ※ intervals はオブジェクト（配列ではない）
+ *
+ * @param  {object}   struct  getChordStructure() の返却値
+ * @returns {number[]}        ピッチクラス配列（0-11）
+ */
+function extractGuideTones(struct) {
+  if (!struct || !struct.intervals) return [];
+  const root = struct.rootPc ?? 0;
+  // intervals は { [pc]: roleName } 形式。
+  // 3度 = root+3(m3) or root+4(M3)、7度 = root+10(b7) or root+11(maj7)
+  const GUIDE_OFFSETS = [3, 4, 10, 11]; // m3, M3, b7, maj7
+  const results = [];
+  GUIDE_OFFSETS.forEach(offset => {
+    const pc = (root + offset) % 12;
+    if (pc in struct.intervals) results.push(pc);
+  });
+  if (results.length === 0) results.push(root); // フォールバック
+  return results;
+}
+
+/**
+ * コード構造からコアトーン（root + 5th + 3rd）のピッチクラスを返す
+ *
+ * @param  {object} struct  getChordStructure() の返却値
+ * @returns {number[]}
+ */
+function extractCoreTones(struct) {
+  if (!struct || !struct.intervals) return [];
+  const root = struct.rootPc ?? 0;
+  // root は常に含む。3度・5度をintervalsから探す
+  const CORE_OFFSETS = [3, 4, 6, 7, 8]; // m3, M3, b5, P5, #5
+  const core = [root];
+  CORE_OFFSETS.forEach(offset => {
+    const pc = (root + offset) % 12;
+    if (pc in struct.intervals) core.push(pc);
+  });
+  return [...new Set(core)];
+}
+
+// ---------------------------------------------------------------
+// 動的引き算ボイシングエンジン
+// ---------------------------------------------------------------
+
+/**
+ * ユーザーの演奏複雑度に応じてパートナーのイベント列を間引く
+ *
+ * complexity:
+ *   0.0 〜 0.39 → フルボイシング（変更なし）
+ *   0.4 〜 0.79 → コアトーン（root+5th+3rd）のみ残す
+ *   0.8 〜 1.0  → ガイドトーン（3rd+7th）のみ残す
+ *
+ * @param {object[]} events      SoloEvent[]
+ * @param {number}   complexity  0.0 〜 1.0
+ * @param {string}   chord       コード名
+ * @param {string}   key         キー名
+ * @returns {object[]}
+ */
+function applySubtractionVoicing(events, complexity, chord, key) {
+  if (complexity < 0.4) return events;
+
+  const struct = (typeof getChordStructure === 'function')
+    ? getChordStructure(chord) : null;
+  if (!struct) return events;
+
+  if (complexity >= 0.8) {
+    // ガイドトーン(3rd+7th) + bass のみ
+    const guide = extractGuideTones(struct);
+    return events.filter(ev =>
+      ev.voice === 'bass' ||
+      guide.includes(ev.midi % 12)
+    );
+  }
+
+  // コアトーン(root+5th+3rd) + bass
+  const core = extractCoreTones(struct);
+  return events.filter(ev =>
+    ev.voice === 'bass' ||
+    core.includes(ev.midi % 12)
+  );
+}
+
+// ---------------------------------------------------------------
+// Role Mutex チェック
+// ---------------------------------------------------------------
+
+/**
+ * ユーザーが選んだ役割に基づいて、パートナーに割り当てるべき役割を返す
+ * また楽器制約違反があれば警告を返す
+ *
+ * @param {string}   userRole        SESSION_ROLESのキー
+ * @param {string}   userInstrument  INSTRUMENT_PROFILESのキー
+ * @param {string}   partnerInstrument
+ * @returns {{ partnerRole:string, warnings:string[] }}
+ */
+function resolveRoleMutex(userRole, userInstrument, partnerInstrument) {
+  const warnings = [];
+  const userProf    = INSTRUMENT_PROFILES[userInstrument];
+  const partnerProf = INSTRUMENT_PROFILES[partnerInstrument];
+
+  // 楽器制約チェック
+  if (userProf && userProf.roleCapable[userRole] === false) {
+    warnings.push(userProf.bassConstraintLabel ??
+      `${userProf.label} は ${SESSION_ROLES[userRole]?.label} を担当できません`);
+  }
+
+  // 相補的な役割をパートナーに割り当てる
+  const COMPLEMENTARY = {
+    MELODY_HIGH: 'CHORD_COMP',
+    MELODY_MID:  'CHORD_COMP',
+    CHORD_COMP:  'MELODY_HIGH',
+    BASS:        'MELODY_HIGH',
+    OBBLIGATO:   'CHORD_COMP',
+    RHYTHM:      'MELODY_MID',
+  };
+  let partnerRole = COMPLEMENTARY[userRole] ?? 'CHORD_COMP';
+
+  // パートナーが担えない役割ならフォールバック
+  if (partnerProf && partnerProf.roleCapable[partnerRole] === false) {
+    partnerRole = Object.keys(SESSION_ROLES).find(r =>
+      partnerProf.roleCapable[r] === true && r !== userRole
+    ) ?? 'CHORD_COMP';
+    warnings.push(`${partnerProf.label} は代わりに ${SESSION_ROLES[partnerRole]?.label} を担当します`);
+  }
+
+  // RHYTHM同士の警告
+  if (userRole === 'RHYTHM' && partnerRole === 'RHYTHM') {
+    const g = ROLE_MUTEX_GROUPS.find(g => g.id === 'dual_rhythm');
+    if (g) warnings.push(g.warnText);
+  }
+
+  return { partnerRole, warnings };
+}
+
+// ---------------------------------------------------------------
+// パートナースコア生成パイプライン
+// ---------------------------------------------------------------
+
+/**
+ * セッションパートナーのSoloScoreを生成する
+ *
+ * buildSoloScore() / buildIntegratedScore() を流用し、
+ * userRoles に応じてvoiceをフィルタリングする。
+ *
+ * @param {object} opts
+ * @param {string[]}  opts.chords
+ * @param {string}    opts.key
+ * @param {string}    opts.genre
+ * @param {string}    opts.partnerInstrument  INSTRUMENT_PROFILESのキー
+ * @param {string}    opts.partnerRole        SESSION_ROLESのキー
+ * @param {string}    opts.userRole           SESSION_ROLESのキー
+ * @param {number}    opts.complexity         0.0〜1.0
+ * @param {string}    opts.arrangeStyle       'standard'|'lyrical'
+ * @returns {SessionScore}
+ */
+function buildPartnerScore(opts) {
+  const {
+    chords, key, genre,
+    partnerInstrument = 'ukulele_high_g',
+    partnerRole       = 'CHORD_COMP',
+    userRole          = 'MELODY_HIGH',
+    complexity        = 0.5,
+    arrangeStyle      = 'standard',
+  } = opts;
+
+  const partnerProf = INSTRUMENT_PROFILES[partnerInstrument];
+
+  // Step 1: ベーススコアをbuildSoloScoreで生成
+  const baseScore = buildSoloScore(chords, key, {
+    genre,
+    arrangeStyle,
+    difficulty: 'mid',
+  });
+
+  // Step 2: userRole に応じてパートナー担当外の voice を削除
+  const voiceRole = SESSION_ROLES[userRole]?.voice;
+  const filterVoice = voiceRole === 'melody' ? 'melody'
+                    : voiceRole === 'bass'   ? 'bass'
+                    : null;
+
+  baseScore.measures = baseScore.measures.map(m => {
+    let events = m.events ?? [];
+    // ユーザーが担う voice はパートナーから削除（音域の棲み分け）
+    if (filterVoice) {
+      events = events.filter(ev => ev.voice !== filterVoice);
+    }
+    // パートナー楽器が担えない voice を削除
+    if (partnerProf) {
+      if (!partnerProf.roleCapable.BASS) {
+        events = events.filter(ev => ev.voice !== 'bass');
+      }
+    }
+    return { ...m, events };
+  });
+
+  // Step 3: 引き算ボイシング適用
+  baseScore.measures = baseScore.measures.map(m => {
+    const events = (m.events ?? []).map(ev => {
+      const result = applySubtractionVoicing([ev], complexity, m.chord ?? chords[0], key);
+      return result[0] ?? null;
+    }).filter(Boolean);
+    return { ...m, events };
+  });
+
+  // Step 4: 帯域データを付加
+  const freqBands = buildFreqBands(baseScore.measures);
+
+  return {
+    ...baseScore,
+    freqBands,
+    partnerRole,
+    userRole,
+    partnerInstrument,
+    _isSessionScore: true,
+  };
+}
+
+// ---------------------------------------------------------------
+// MIDIインポート → セッションスコア変換
+// ---------------------------------------------------------------
+
+/**
+ * MIDIファイルのArrayBuffer → SessionScore 変換
+ *
+ * 現システムの parseMidi() を流用し、セッションパートナーとして
+ * 使えるスコアに変換する。
+ *
+ * @param {ArrayBuffer} arrayBuffer
+ * @param {object} opts
+ * @param {string}  opts.key              キー名（自動推定またはユーザー指定）
+ * @param {string}  opts.partnerInstrument
+ * @param {string}  opts.userRole
+ * @param {number}  opts.splitPoint       左右手分離MIDI値（デフォルト:60）
+ * @returns {SessionScore}
+ */
+function buildSessionScoreFromMidi(arrayBuffer, opts = {}) {
+  const {
+    key               = 'C',
+    partnerInstrument = 'piano',
+    userRole          = 'MELODY_HIGH',
+    splitPoint        = 60,
+  } = opts;
+
+  // Step 1: parseMidi（現システム流用）
+  const midiData = parseMidi(arrayBuffer);
+  const tempo    = Math.round(60_000_000 / (midiData.tempo ?? 500000));
+
+  // Step 2: 全トラックを統合し音域で左右手に分離
+  const { leftNotes, rightNotes } = _splitMidiByPitch(midiData.tracks, midiData.ticksPerBeat, splitPoint);
+
+  // Step 3: tick → 小節単位の SessionMeasure[] に変換
+  const measures = _buildMeasuresFromNotes([...leftNotes, ...rightNotes], midiData.ticksPerBeat);
+
+  // Step 4: 各音符に役割・voice を自動推定
+  _assignRolesFromPitch(measures, splitPoint);
+
+  // Step 4b: 各小節のコード名を音符から推定
+  //   chord=null のままだと drawSoloTab でコード名が "null" と表示されるため、
+  //   小節内の音符ピッチクラスから最も近いコード名を推定する。
+  //   完全な推定は複雑なため、ルート音（最低音）+ 性質（メジャー/マイナー）の
+  //   簡易判定で代替する。
+  measures.forEach(m => {
+    if (m.chord) return;
+    const midis = (m.events ?? []).map(e => e.midi).filter(Number.isFinite);
+    if (midis.length === 0) { m.chord = opts.key ?? 'C'; return; }
+    const pcs    = [...new Set(midis.map(mid => mid % 12))];
+    const rootPc = midis.reduce((a,b) => a < b ? a : b) % 12; // 最低音をroot候補
+    const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    const rootName   = NOTE_NAMES[rootPc];
+    // マイナー3度(3半音)があればマイナー判定
+    const hasMinor3  = pcs.includes((rootPc + 3) % 12);
+    const hasMajor3  = pcs.includes((rootPc + 4) % 12);
+    m.chord = hasMinor3 && !hasMajor3 ? rootName + 'm' : rootName;
+  });
+
+  // Step 5: userRole に応じて voice をフィルタ（引き算）
+  const voiceToRemove = SESSION_ROLES[userRole]?.voice;
+  if (voiceToRemove) {
+    measures.forEach(m => {
+      m.events = (m.events ?? []).filter(ev => ev.voice !== voiceToRemove);
+    });
+  }
+
+  // Step 6: 帯域データを生成
+  const freqBands = buildFreqBands(measures);
+
+  return {
+    key,
+    tempo,
+    timeSignature: [4, 4],
+    style:         'session_midi',
+    measures,
+    freqBands,
+    partnerRole:   _guessPartnerRole(measures),
+    userRole,
+    partnerInstrument,
+    _isSessionScore: true,
+    source:        'midi_import',
+  };
+}
+
+/**
+ * MIDIトラック群をtick→beat変換し音符リストに展開
+ * @private
+ */
+function _splitMidiByPitch(tracks, tpb, splitPoint) {
+  const leftNotes  = [];
+  const rightNotes = [];
+
+  tracks.forEach((track, tIdx) => {
+    const active = new Map();
+    track.forEach(ev => {
+      if (ev.type === 'noteOn' && ev.velocity > 0) {
+        active.set(`${ev.note}_${ev.channel}`, {
+          tick: ev.tick, velocity: ev.velocity,
+        });
+      } else if (ev.type === 'noteOff' ||
+                 (ev.type === 'noteOn' && ev.velocity === 0)) {
+        const key = `${ev.note}_${ev.channel}`;
+        const on  = active.get(key);
+        if (!on) return;
+        const beatOn  = on.tick  / tpb + 1;         // 1始まり
+        const durBeat = (ev.tick - on.tick) / tpb;
+        const note = {
+          midi:     ev.note,
+          beatOn,
+          duration: Math.max(0.125, durBeat),
+          velocity: on.velocity,
+          track:    tIdx,
+        };
+        if (ev.note < splitPoint) leftNotes.push(note);
+        else                      rightNotes.push(note);
+        active.delete(key);
+      }
+    });
+  });
+
+  return { leftNotes, rightNotes };
+}
+
+/**
+ * 音符リストを小節（4/4拍子）ごとにグルーピング
+ * @private
+ */
+function _buildMeasuresFromNotes(allNotes, tpb) {
+  const measureMap = new Map();
+  allNotes.forEach(note => {
+    const mi        = Math.floor((note.beatOn - 1) / 4);
+    const localBeat = ((note.beatOn - 1) % 4) + 1;
+    if (!measureMap.has(mi)) measureMap.set(mi, { events: [], chord: null });
+    measureMap.get(mi).events.push({
+      beat:     localBeat,
+      duration: Math.min(note.duration, 4.5 - localBeat),
+      midi:     note.midi,
+      fret:     null,      // 後で midiToFretOptions で解決
+      stringIdx: null,
+      voice:    null,      // _assignRolesFromPitch で付与
+      role:     'passing',
+      technique:'normal',
+      playStyle:'picking',
+      emphasis: note.velocity / 127,
+      _measureIdx: mi,
+    });
+  });
+
+  const measures = Array.from(measureMap.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([mi, data], i) => ({
+      number: i + 1,
+      chord:  data.chord,
+      events: data.events,
+      beatsPerBar: 4,
+    }));
+
+  // フレット位置を解決（ウクレレの場合のみ）
+  measures.forEach(m => {
+    m.events.forEach(ev => {
+      const opts = (typeof midiToFretOptions === 'function')
+        ? midiToFretOptions(ev.midi) : [];
+      if (opts.length > 0) {
+        ev.stringIdx = opts[0].stringIdx;
+        ev.fret      = opts[0].fret;
+      }
+    });
+  });
+
+  return measures;
+}
+
+/**
+ * 音域に基づいて各イベントに voice / role を自動推定
+ * @private
+ */
+function _assignRolesFromPitch(measures, splitPoint) {
+  measures.forEach(m => {
+    m.events.forEach(ev => {
+      if (ev.midi < splitPoint) {
+        ev.voice = 'bass';
+        ev.role  = 'root';
+      } else if (ev.midi >= 72) {
+        ev.voice = 'melody';
+        ev.role  = 'stable';
+      } else {
+        ev.voice = 'inner';
+        ev.role  = 'color';
+      }
+    });
+  });
+}
+
+/**
+ * スコアの音域分布からパートナーの主な役割を推定
+ * @private
+ */
+function _guessPartnerRole(measures) {
+  let bassCount = 0, midCount = 0, highCount = 0;
+  measures.forEach(m => {
+    (m.events ?? []).forEach(ev => {
+      if      (ev.midi < 60) bassCount++;
+      else if (ev.midi < 72) midCount++;
+      else                   highCount++;
+    });
+  });
+  if (bassCount > midCount && bassCount > highCount) return 'BASS';
+  if (highCount > midCount) return 'MELODY_HIGH';
+  return 'CHORD_COMP';
+}
+
+// ---------------------------------------------------------------
+// 帯域データ生成
+// ---------------------------------------------------------------
+
+/**
+ * 各小節・各拍の「占有MIDI帯域」を計算する
+ * session_ui.txt の帯域ビジュアライザが消費するデータ
+ *
+ * @param {object[]} measures  SessionScore.measures[]
+ * @returns {Array<Array<FreqBandEntry>>}
+ *   [measureIdx][beatIdx] = {
+ *     beat, occupied:number[], occupiedRange:{min,max}|null, roles:string[]
+ *   }
+ */
+function buildFreqBands(measures) {
+  const GRID = FREQ_VIZ.BEAT_GRID;
+
+  return (measures ?? []).map(m => {
+    return GRID.map(beat => {
+      const active = (m.events ?? []).filter(ev => {
+        const dur = ev.duration ?? 0.5;
+        return ev.beat <= beat && beat < ev.beat + dur;
+      });
+      const midis = active.map(ev => ev.midi).filter(Number.isFinite);
+      return {
+        beat,
+        occupied:      midis,
+        occupiedRange: midis.length > 0
+          ? { min: Math.min(...midis), max: Math.max(...midis) }
+          : null,
+        voices:        active.map(ev => ev.voice ?? 'unknown'),
+      };
+    });
+  });
+}
+
+// ---------------------------------------------------------------
+// 空き帯域ヒント生成
+// ---------------------------------------------------------------
+
+/**
+ * 特定の beat における空き帯域を算出し、ユーザーへのヒントを返す
+ *
+ * @param {object}  freqBand        buildFreqBands()[mi][bi] の1エントリ
+ * @param {string}  userInstrument  INSTRUMENT_PROFILESのキー
+ * @returns {{ hint:string, role:string|null, playableMidi:number[] }}
+ */
+function generateSpaceHint(freqBand, userInstrument) {
+  const profile = INSTRUMENT_PROFILES[userInstrument];
+  if (!profile) return { hint: '', subHint: '', role: null, playableMidi: [] };
+
+  const occupied = new Set(freqBand.occupied ?? []);
+  const playable = [];
+  for (let m = profile.range.min; m <= profile.range.max; m++) {
+    if (!occupied.has(m)) playable.push(m);
+  }
+
+  // ── ランダム文言ピッカー ──
+  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+  // ── 空き帯域ゼロ：引いて聴くタイミング ──
+  if (playable.length === 0) {
+    return {
+      hint: pick([
+        '今は引く番 — 音を出さないのも演奏',
+        'パートナーに聴き入ろう',
+        '音の隙間を待つ',
+        '「休符」も立派な音楽',
+        '弾かない勇気が引き算の真髄',
+      ]),
+      subHint: 'パートナーの音域が全体を覆っています。次の隙間を狙いましょう。',
+      role: null,
+      playableMidi: [],
+    };
+  }
+
+  // ── 高音域（A弦 5〜12fret 付近 MIDI72以上）に空きあり ──
+  const highPlayable = playable.filter(m => m >= 72);
+  if (highPlayable.length >= 2) {
+    return {
+      hint: pick([
+        'A弦ハイフレット — オブリガードのチャンス！',
+        '高音域が空いてる！ 短いフレーズを差し込もう',
+        'A弦でキラリと光るフレーズを',
+        'メロディの合間に一言添えよう',
+        '上が空いた！ 飛び込んでいい',
+      ]),
+      subHint: pick([
+        '2〜3音の短いフレーズが効果的です',
+        'パートナーが息継ぎしています',
+        '長く弾きすぎず、すぐ引きましょう',
+        '装飾音を1音入れるだけでも変わります',
+      ]),
+      role: 'OBBLIGATO',
+      playableMidi: highPlayable,
+    };
+  }
+
+  // ── 中音域（E/C弦 MIDI64〜71）に空きあり ──
+  const midPlayable = playable.filter(m => m >= 64 && m < 72);
+  if (midPlayable.length >= 2) {
+    return {
+      hint: pick([
+        'E/C弦でコンピングを',
+        '中音域が開いた — コードトーンを散らそう',
+        'コードの3度か7度を1音だけ置こう',
+        '内声に一音そっと添えよう',
+        '中域で静かに支える',
+      ]),
+      subHint: pick([
+        '拍頭だけ弾いて後は休むのがコツ',
+        'コードトーンを1〜2音、シンプルに',
+        '音を置いたらすぐ引く',
+        'ストロークより単音の方が空間が生まれます',
+      ]),
+      role: 'CHORD_COMP',
+      playableMidi: midPlayable,
+    };
+  }
+
+  // ── 低音域（G弦 MIDI43〜63）に空きあり ──
+  const lowPlayable = playable.filter(m => m < 64);
+  if (lowPlayable.length >= 1) {
+    return {
+      hint: pick([
+        'ルート音をそっと置こう',
+        '低音域が空いています',
+        'ベースラインのチャンス',
+        'G弦でルートを一音だけ',
+      ]),
+      subHint: pick([
+        '1小節に1〜2音で十分です',
+        '音を伸ばしてみましょう',
+        '低音は少ないほど効果的です',
+      ]),
+      role: 'BASS',
+      playableMidi: lowPlayable,
+    };
+  }
+
+  // ── 断片的な空きのみ ──
+  return {
+    hint: pick([
+      'わずかな隙間 — 1音だけ置いてみよう',
+      '狭い空き — 短く入れて素早く引く',
+      'ほんの少しスペースがある',
+    ]),
+    subHint: '音を詰め込まず、1音だけ試してみましょう。',
+    role: 'OBBLIGATO',
+    playableMidi: playable,
+  };
+}
+
+// ---------------------------------------------------------------
+// バトンタッチ：役割スケジュール生成
+// ---------------------------------------------------------------
+
+/**
+ * 指定小節数ごとに役割が交代するスケジュールを生成する
+ *
+ * @param {number}  totalMeasures
+ * @param {number}  switchEvery      何小節ごとに交代するか
+ * @param {string}  roleA            最初のユーザー役割
+ * @param {string}  roleB            交代後のユーザー役割
+ * @param {string}  [userInstrument='ukulele_high_g']
+ * @param {string}  [partnerInstrument='ukulele_high_g']
+ * @returns {Array<{measureIdx:number, userRole:string, partnerRole:string}>}
+ */
+function buildBatonSchedule(
+  totalMeasures, switchEvery, roleA, roleB,
+  userInstrument    = 'ukulele_high_g',
+  partnerInstrument = 'ukulele_high_g'
+) {
+  const schedule = [];
+  for (let mi = 0; mi < totalMeasures; mi++) {
+    const phase    = Math.floor(mi / switchEvery) % 2;
+    const userRole = phase === 0 ? roleA : roleB;
+    const { partnerRole } = resolveRoleMutex(userRole, userInstrument, partnerInstrument);
+    schedule.push({ measureIdx: mi, userRole, partnerRole });
+  }
+  return schedule;
+}
+
+/**
+ * バトンタッチ時にパートナースコアを役割に応じて再フィルタする
+ *
+ * @param {object}  baseScore   buildPartnerScore() の出力
+ * @param {string}  newUserRole 新しいユーザー役割
+ * @param {string}  key
+ * @param {number}  complexity
+ * @returns {object}  measures の events を再構築したスコア
+ */
+function reapplyBatonRoles(baseScore, newUserRole, key, complexity) {
+  const voiceToRemove = SESSION_ROLES[newUserRole]?.voice;
+  const measures = (baseScore.measures ?? []).map(m => {
+    let events = (m.events ?? []).slice();
+    if (voiceToRemove) {
+      events = events.filter(ev => ev.voice !== voiceToRemove);
+    }
+    // 引き算ボイシング再適用
+    events = events.flatMap(ev => {
+      const r = applySubtractionVoicing([ev], complexity, m.chord ?? '', key);
+      return r;
+    });
+    return { ...m, events };
+  });
+  const freqBands = buildFreqBands(measures);
+  return { ...baseScore, measures, freqBands, userRole: newUserRole };
+}
+</script>

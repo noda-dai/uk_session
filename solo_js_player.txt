@@ -1,0 +1,838 @@
+<script>
+// ===================================================================
+// solo_js_player.txt  ― ソロウクレレ タブ譜 再生エンジン v6
+//
+// v5 → v6: メロディ音量・聴こえの改善（5点）
+//
+// [Fix1] VOICE_GAIN melody 0.90→1.30
+//        2オシレータ×0.5スケールで実効ゲインが半減していた問題を修正
+//
+// [Fix2] melody/bass ゲイン比の改善
+//        bass 0.72→0.60、melody/bass比 1.4倍→2.5倍
+//        メロディが低音域に埋もれない音量バランスに変更
+//
+// [Fix3] melody baseDecay 1.5→2.2
+//        8分音符(0.3s)でも次の音まで十分聴こえるよう音の伸びを確保
+//
+// [Fix4] melody fcEnd 1.6→2.5
+//        decay後半の高域カットオフを上げ、残響が明るく保たれるよう調整
+//
+// [Fix5] ボディ共鳴送り量を声部別に変更
+//        旧: 全声部均一 0.13
+//        新: melody=0.08 / bass=0.22 / inner=0.10
+//        bassのlow成分がmelodyをマスクしていた問題を解消
+// ===================================================================
+
+// ---------------------------------------------------------------
+// プレイヤー状態
+// ---------------------------------------------------------------
+
+const SoloPlayer = {
+  ctx:                null,
+  masterGain:         null,
+  compressor:         null,
+  isPlaying:          false,
+  isPaused:           false,
+  startAudioTime:     0,
+  pauseAudioOffset:   0,
+  schedulerTimer:     null,
+  LOOKAHEAD:          0.25,
+  INTERVAL_MS:        80,
+  score:              null,
+  allEvents:          [],
+  measureStartTimes:  [],   // [BugD] 小節ごとの開始時刻テーブル
+  nextEventIdx:       0,
+  totalDuration:      0,
+  tempo:              100,
+  loop:               false,
+  mute:               { melody: false, bass: false, inner: false },
+  currentMeasure:     -1,
+};
+
+// ---------------------------------------------------------------
+// AudioContext 初期化
+// ---------------------------------------------------------------
+
+function _soloPlayerInitAudio() {
+  if (SoloPlayer.ctx) return;
+  try {
+    const ctx  = new (window.AudioContext || window.webkitAudioContext)();
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -18;
+    comp.knee.value      =  12;
+    comp.ratio.value     =   4;
+    comp.attack.value    = 0.003;
+    comp.release.value   = 0.15;
+    const master = ctx.createGain();
+    master.gain.value = 0.75;
+    master.connect(comp);
+    comp.connect(ctx.destination);
+    SoloPlayer.ctx        = ctx;
+    SoloPlayer.masterGain = master;
+    SoloPlayer.compressor = comp;
+
+    // [A][C] PeriodicWave（弦番号別4種）をここで一度だけ生成・キャッシュ
+    _ukWave = _buildUkuleleWaves(ctx);
+    // [B] ボディ共鳴ノードをここで一度だけ生成・キャッシュ
+    _ukBody = _buildBodyResonance(ctx, master);
+  } catch (e) {
+    console.error('AudioContext 初期化失敗:', e);
+  }
+}
+
+// ---------------------------------------------------------------
+// [D] フレット別周波数テーブル
+// ---------------------------------------------------------------
+
+/**
+ * ウクレレ標準チューニング（High-G, A=440Hz基準）の開放弦周波数
+ * インデックス: 0=G弦(4弦), 1=C弦(3弦), 2=E弦(2弦), 3=A弦(1弦)
+ * ※ solo_js_engine.txt の SOLO_OPEN_MIDI = [67, 60, 64, 69] と対応
+ */
+const UKULELE_OPEN_FREQ = [
+  392.0,  // 0: G4  (4弦)
+  261.6,  // 1: C4  (3弦)
+  329.6,  // 2: E4  (2弦)
+  440.0,  // 3: A4  (1弦)
+];
+
+/**
+ * 弦インデックスとフレット番号から正確な周波数を返す。
+ * freq = openFreq × 2^(fret/12)
+ *
+ * @param {number} stringIdx  0=G弦, 1=C弦, 2=E弦, 3=A弦
+ * @param {number} fret       0〜12
+ * @returns {number} Hz
+ */
+function _fretToFreq(stringIdx, fret) {
+  const open = UKULELE_OPEN_FREQ[stringIdx];
+  if (open === undefined || fret < 0) return 440.0;
+  return open * Math.pow(2, fret / 12);
+}
+
+// ---------------------------------------------------------------
+// [C] PeriodicWave 生成（弦番号別4種・キャッシュ）
+// ---------------------------------------------------------------
+// フーリエ係数の設計:
+//   imag[n] = 1/n^alpha
+//   alpha:  弦ごとに設定（低弦ほど倍音豊か＝alphaが小さい）
+//     G弦(0): alpha=1.7  ナイロン系・高G独特の軽い明るさ
+//     C弦(1): alpha=2.1  フロロカーボン・丸く太い
+//     E弦(2): alpha=1.8  ナイロン・中間的
+//     A弦(3): alpha=1.5  ナイロン・最も明るい
+//   + n=2,3 にボディ共鳴による微増（ウクレレの「ぽこぽこ」感）
+//   real[] は全て 0（位相整合のため純正弦成分のみ）
+
+let _ukWave = null; // { str0, str1, str2, str3 }（弦番号別）
+let _ukBody = null; // ボディ共鳴ノード（DelayフィードバックループNode）
+
+function _buildUkuleleWaves(ctx) {
+  // 弦ごとの倍音パラメータ定義
+  // [alpha, bodyBoost_n2, bodyBoost_n3]
+  const STRING_PARAMS = [
+    [1.7, 1.20, 1.08],  // 0: G弦 - High-G特有の軽い倍音
+    [2.1, 1.10, 1.00],  // 1: C弦 - 丸く太い（フロロカーボン系）
+    [1.8, 1.15, 1.05],  // 2: E弦 - 中間
+    [1.5, 1.30, 1.12],  // 3: A弦 - 最も明るい（メロディ弦）
+  ];
+
+  function makeWave(alpha, boost2, boost3) {
+    const N    = 18;
+    const real = new Float32Array(N + 1);
+    const imag = new Float32Array(N + 1);
+    for (let n = 1; n <= N; n++) {
+      imag[n] = 1.0 / Math.pow(n, alpha);
+    }
+    imag[2] *= boost2;
+    imag[3] *= boost3;
+    // 正規化（基音=1.0）
+    const base = imag[1];
+    for (let n = 0; n <= N; n++) imag[n] /= base;
+    return ctx.createPeriodicWave(real, imag, { disableNormalization: true });
+  }
+
+  return {
+    str0: makeWave(...STRING_PARAMS[0]),
+    str1: makeWave(...STRING_PARAMS[1]),
+    str2: makeWave(...STRING_PARAMS[2]),
+    str3: makeWave(...STRING_PARAMS[3]),
+    // 声部フォールバック用（旧互換）
+    melody: makeWave(1.5, 1.30, 1.12),
+    bass:   makeWave(2.1, 1.10, 1.00),
+    inner:  makeWave(1.8, 1.15, 1.05),
+  };
+}
+
+// ---------------------------------------------------------------
+// [B] ボディ共鳴シミュレーション（Delay フィードバックループ）
+// ---------------------------------------------------------------
+// [Fix5] 声部別ボディ共鳴送り量に変更
+//        旧: 全声部に bodyGain=0.13 を等量送信
+//        新: melody=0.08（控えめ）、bass=0.20（豊か）、inner=0.10
+//        → bassのlow成分がmelodyをマスクする問題を解消
+//        声部ごとの bodyGain は _pluckUkulele() 側で制御するため、
+//        _buildBodyResonance() は入力ノードをそのまま返す構成に変更。
+
+function _buildBodyResonance(ctx, dest) {
+  // Dry（直通）
+  const dryGain = ctx.createGain();
+  dryGain.gain.value = 1.0;
+  dryGain.connect(dest);
+
+  // Wet（ボディ共鳴）
+  // [Fix5] bodyGain は発音側(_pluckUkulele)で声部別に設定するため
+  //        ここでは gain=1.0 のパススルーノードとして定義
+  const bodyInput = ctx.createGain();
+  bodyInput.gain.value = 1.0;
+
+  const delay = ctx.createDelay(0.1);
+  delay.delayTime.value = 0.020; // 20ms = ウクレレボディの初期反射
+
+  const fbFilter = ctx.createBiquadFilter();
+  fbFilter.type = 'lowpass';
+  fbFilter.frequency.value = 1800;
+  fbFilter.Q.value = 0.7;
+
+  const fbGain = ctx.createGain();
+  fbGain.gain.value = 0.10;
+
+  const wetGain = ctx.createGain();
+  wetGain.gain.value = 0.18;
+
+  // 接続
+  bodyInput.connect(delay);
+  delay.connect(fbFilter);
+  fbFilter.connect(fbGain);
+  fbGain.connect(delay);       // フィードバックループ
+  fbFilter.connect(wetGain);
+  wetGain.connect(dest);
+
+  return { dry: dryGain, body: bodyInput };
+}
+
+// ---------------------------------------------------------------
+// ウクレレ音源 v5
+// [A] 2オシレータ・デチューン
+// [B] ボディ共鳴への送り込み
+// [C] 弦番号連動 PeriodicWave
+// [D] fretToFreq による正確な周波数
+// ---------------------------------------------------------------
+
+function _pluckUkulele(ctx, dest, freq, gainVal, startTime, durSec, voice, stringIdx) {
+  if (!ctx || freq <= 0 || gainVal <= 0) return;
+  if (!_ukWave) _ukWave = _buildUkuleleWaves(ctx);
+  if (!_ukBody) _ukBody = _buildBodyResonance(ctx, dest);
+
+  // [C] 弦番号で PeriodicWave を選択
+  // stringIdx が渡された場合は弦別Wave、なければ声部フォールバック
+  const waveKey = (stringIdx !== undefined && stringIdx >= 0 && stringIdx <= 3)
+    ? `str${stringIdx}`
+    : voice;
+  const wave = _ukWave[waveKey] ?? _ukWave.melody;
+
+  // 声部別パラメータ
+  // [Fix3] melody baseDecay を 1.5 → 2.2 に延長
+  //        8分音符(0.3s)でdecay=min(2.2, 0.3*1.8=0.54)→0.54s
+  //        次の音が来るまで(0.3s)十分に聴こえる長さを確保
+  // [Fix4] melody fcEnd を 1.6 → 2.5 に上げる（残響が明るめに保たれる）
+  const VDEF = {
+    melody: { baseDecay: 2.2, fcStart: 9.0,  fcEnd: 2.5, scale: 1.00, detune: 1.2 },
+    // [Step1-R] bass baseDecay 2.0→1.2: 低音の持続がmelodyを混濁させていた
+    //           bassは拍頭のアクセントを刻んで素早く引くのが自然
+    bass:   { baseDecay: 1.2, fcStart: 4.5,  fcEnd: 1.2, scale: 0.88, detune: 2.5 },
+    inner:  { baseDecay: 1.0, fcStart: 6.0,  fcEnd: 1.4, scale: 0.52, detune: 1.8 },
+  };
+  const def = VDEF[voice] ?? VDEF.melody;
+
+  // [C] 音域連動 decay: 高音ほど速く減衰（弦の物理特性）
+  const freqDecay  = def.baseDecay * Math.pow(440 / Math.max(freq, 200), 0.3);
+  const decay      = Math.min(freqDecay, durSec * 1.8);
+  const releaseEnd = startTime + Math.max(decay, 0.06);
+
+  // [A] デチューン量: 声部＋弦番号で調整
+  //     低弦ほどビート感を大きく（弦が太いほど揺らぎが出やすい）
+  const STRING_DETUNE_FACTOR = [1.6, 1.4, 1.1, 0.8]; // G,C,E,A
+  const stringFactor = (stringIdx !== undefined && stringIdx >= 0)
+    ? (STRING_DETUNE_FACTOR[stringIdx] ?? 1.0)
+    : 1.0;
+  const detuneCent = def.detune * stringFactor; // セント単位
+
+  // [A] オシレータ2本（+detune / -detune）
+  function makeOsc(detuneOffset) {
+    const osc = ctx.createOscillator();
+    osc.setPeriodicWave(wave);
+    osc.frequency.value = freq;
+    osc.detune.value    = detuneOffset;
+    return osc;
+  }
+  const osc1 = makeOsc(+detuneCent);
+  const osc2 = makeOsc(-detuneCent);
+
+  // [B] 時変フィルタ: プラック後に明るさが落ちる
+  const lpf = ctx.createBiquadFilter();
+  lpf.type = 'lowpass';
+  lpf.frequency.setValueAtTime(
+    Math.min(freq * def.fcStart, ctx.sampleRate * 0.45),
+    startTime
+  );
+  lpf.frequency.exponentialRampToValueAtTime(
+    Math.min(freq * def.fcEnd, ctx.sampleRate * 0.45),
+    startTime + decay * 0.4
+  );
+  lpf.Q.value = 0.7;
+
+  // エンベロープ
+  const env = ctx.createGain();
+  const peak = gainVal * def.scale * 0.5; // 2本分なので 0.5 スケール
+  env.gain.setValueAtTime(0.0001, startTime);
+  env.gain.linearRampToValueAtTime(peak,   startTime + 0.003); // 3ms attack
+  env.gain.exponentialRampToValueAtTime(0.0001, releaseEnd);
+
+  // [Fix5] 声部別ボディ共鳴送り量
+  //        melody: 控えめ(0.08) → bassのlow成分にマスクされない
+  //        bass:   豊か(0.22)   → 箱鳴り感を強調
+  //        inner:  中間(0.10)
+  const BODY_SEND = { melody: 0.08, bass: 0.22, inner: 0.10 };
+  const bodySendGain = ctx.createGain();
+  bodySendGain.gain.value = BODY_SEND[voice] ?? 0.10;
+
+  // 接続: osc1,osc2 → lpf → env → _ukBody.dry (直通)
+  //                               → bodySendGain → _ukBody.body (共鳴、声部別量)
+  osc1.connect(lpf);
+  osc2.connect(lpf);
+  lpf.connect(env);
+  env.connect(_ukBody.dry);
+  env.connect(bodySendGain);
+  bodySendGain.connect(_ukBody.body);
+
+  osc1.start(startTime);
+  osc2.start(startTime);
+  osc1.stop(releaseEnd + 0.05);
+  osc2.stop(releaseEnd + 0.05);
+
+  // 解放
+  const cleanup = () => {
+    try {
+      osc1.disconnect(); osc2.disconnect();
+      lpf.disconnect(); env.disconnect();
+      bodySendGain.disconnect();
+    } catch (_) {}
+  };
+  osc1.onended = cleanup;
+  // startTime が過去時刻（スケジューラ遅延）の場合に負値になるのを防ぐ
+  const cleanupDelay = Math.max(0, (releaseEnd - ctx.currentTime + 0.3) * 1000);
+  setTimeout(cleanup, cleanupDelay);
+}
+
+// ---------------------------------------------------------------
+// MIDI → 周波数（後方互換・内部用）
+// ---------------------------------------------------------------
+
+function _midiToFreq(midi) {
+  return 440 * Math.pow(2, (midi - 69) / 12);
+}
+
+// ---------------------------------------------------------------
+// イベント列を絶対時刻（秒）に展開 [BugD完了]
+// beatsPerBar を小節ごとに参照し、measureStartTimes[] と totalDuration も返す
+// ---------------------------------------------------------------
+
+function _buildAbsoluteTimeline(score, tempo) {
+  const secPerBeat        = 60 / tempo;
+  const events            = [];
+  const measureStartTimes = [];
+
+  // [Lyrical] タイ延長用マップ: absTime_stringIdx → eventオブジェクト
+  // tieIn=true の音符が来たとき、直前の同弦同音イベントの durSec を延長する
+  const tieTargetMap = new Map();
+
+  let measureStartSec = 0;
+  score.measures.forEach((m, mi) => {
+    const beatsThisBar = m.beatsPerBar ?? 4;
+    measureStartTimes.push(measureStartSec);
+
+    m.events.forEach(ev => {
+      if (ev.midi === undefined || ev.midi === null || ev.voice === undefined) return;
+      // 旧来の tie フラグ（solo_js_engine の SoloEvent.tie）はスキップ
+      if (ev.tie) return;
+      // [Lyrical] tieIn=true の音符: 直前の同音イベントを延長してこの音符は発音しない
+      if (ev.tieIn) {
+        const key = `${ev.stringIdx}_${ev.midi}`;
+        const prev = tieTargetMap.get(key);
+        if (prev) {
+          // 前音符の持続時間に今の duration を加算
+          prev.durSec += ev.duration * secPerBeat;
+        }
+        // タイ処理済みのエントリをマップから除去（残存による二重加算を防ぐ）
+        tieTargetMap.delete(key);
+        // この音符自体は発音しない（return でスキップ）
+        return;
+      }
+
+      const absTime = measureStartSec + (ev.beat - 1) * secPerBeat;
+      const entry = {
+        absTime,
+        durSec:     ev.duration * secPerBeat,
+        midi:       ev.midi,
+        voice:      ev.voice,
+        stringIdx:  ev.stringIdx,
+        fret:       ev.fret,
+        emphasis:   ev.emphasis ?? 1.0,
+        measureIdx: mi,
+      };
+      events.push(entry);
+
+      // tieOut=true の音符はタイ延長対象として登録（後続 tieIn が参照する）
+      if (ev.tieOut) {
+        const key = `${ev.stringIdx}_${ev.midi}`;
+        tieTargetMap.set(key, entry);
+      } else {
+        // tieOut でない音符が来たらそのキーのマップをクリア（古い参照を解除）
+        const key = `${ev.stringIdx}_${ev.midi}`;
+        tieTargetMap.delete(key);
+      }
+    });
+    measureStartSec += beatsThisBar * secPerBeat;
+  });
+
+  events.sort((a, b) => a.absTime - b.absTime);
+  return { events, measureStartTimes, totalDuration: measureStartSec };
+}
+
+// ---------------------------------------------------------------
+// スケジューラ
+// ---------------------------------------------------------------
+
+function _soloPlayerSchedule() {
+  const { ctx, masterGain, allEvents, mute } = SoloPlayer;
+  if (!ctx || !SoloPlayer.isPlaying) return;
+
+  const elapsed     = ctx.currentTime - SoloPlayer.startAudioTime + SoloPlayer.pauseAudioOffset;
+  const scheduleEnd = elapsed + SoloPlayer.LOOKAHEAD;
+
+  // [Fix1] melody ゲインを v4 水準（0.90）に戻す
+  //        v5で2オシレータ×0.5スケールに変更したためmelodyが半減していた
+  //        peak = gainVal × def.scale × 0.5 なので VOICE_GAINを2倍にして補正
+  // [Fix2] melody/bass比を改善: melody=1.30(実効0.65)、bass=0.60(実効0.26)
+  //        旧melody/bass比1.42→新2.5倍でメロディが前に出る
+  const VOICE_GAIN = { melody: 1.30, bass: 0.60, inner: 0.35 };
+
+  while (SoloPlayer.nextEventIdx < allEvents.length) {
+    const ev = allEvents[SoloPlayer.nextEventIdx];
+    if (ev.absTime > scheduleEnd) break;
+
+    const audioTime = SoloPlayer.startAudioTime + ev.absTime - SoloPlayer.pauseAudioOffset;
+
+    // audioTime が現在時刻より過去の場合は発音をスキップ（インデックスだけ進める）
+    // スケジューラ遅延やテンポ変更直後に発生しうる
+    if (audioTime >= ctx.currentTime - 0.01 && !mute[ev.voice]) {
+      const base    = VOICE_GAIN[ev.voice] ?? 0.5;
+      const gainVal = Math.min(base * (ev.emphasis ?? 1.0), 1.2);
+
+      // [D] stringIdx と fret が有効な場合は _fretToFreq で正確な周波数を使用
+      //     それ以外（タブ外イベント等）は従来通り _midiToFreq にフォールバック
+      let freq;
+      if (ev.stringIdx !== undefined && ev.stringIdx >= 0 && ev.stringIdx <= 3
+          && ev.fret !== undefined && ev.fret >= 0) {
+        freq = _fretToFreq(ev.stringIdx, ev.fret);
+      } else {
+        freq = _midiToFreq(ev.midi);
+      }
+
+      _pluckUkulele(ctx, masterGain, freq, gainVal, audioTime, ev.durSec, ev.voice, ev.stringIdx);
+    }
+
+    SoloPlayer.nextEventIdx++;
+  }
+
+  // 現在小節のハイライト更新 [BugD] measureStartTimes テーブルで正確な小節検索
+  const startTimes = SoloPlayer.measureStartTimes;
+  let currentMi = 0;
+  if (startTimes && startTimes.length > 0) {
+    // elapsed がどの小節に属するかを二分探索
+    let lo = 0, hi = startTimes.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (startTimes[mid] <= elapsed) lo = mid;
+      else hi = mid - 1;
+    }
+    currentMi = lo;
+  } else {
+    // フォールバック: 4拍固定
+    const secPerBeat = 60 / SoloPlayer.tempo;
+    currentMi = Math.floor(Math.max(elapsed, 0) / (4 * secPerBeat));
+  }
+  const clampedMi = Math.min(currentMi, (SoloPlayer.score?.measures?.length ?? 1) - 1);
+
+  if (clampedMi !== SoloPlayer.currentMeasure && clampedMi >= 0) {
+    SoloPlayer.currentMeasure = clampedMi;
+    soloFocusIdx = clampedMi;
+    soloRenderTabSectionFast();
+    _soloPlayerUpdateMeasureLabel(clampedMi);
+  }
+
+  // 終了チェック
+  if (elapsed >= SoloPlayer.totalDuration + 0.3) {
+    SoloPlayer.loop ? soloPlayerRestart() : soloPlayerStop();
+  }
+}
+
+// ---------------------------------------------------------------
+// 高速再描画（フォーカス更新のみ）
+// ---------------------------------------------------------------
+
+let _soloLastScore      = null;
+let _soloFastRenderBusy = false; // [P1] 再入ガード
+
+function soloRenderTabSectionFast() {
+  if (!_soloLastScore)       return;
+  // [P1] drawSoloTab が SVG の onclick 属性で soloPlayerSeekToMeasure を埋め込み、
+  //      seek → soloRenderTabSectionFast → drawSoloTab → seek... の循環が起きうる。
+  //      フラグで二重呼び出しをブロックする。
+  if (_soloFastRenderBusy)   return;
+  _soloFastRenderBusy = true;
+  try {
+    drawSoloTab('solo-tab-svg', _soloLastScore, soloFocusIdx);
+  } finally {
+    _soloFastRenderBusy = false;
+  }
+}
+
+// ---------------------------------------------------------------
+// 公開 API
+// ---------------------------------------------------------------
+
+function soloPlayerPlay(score) {
+  _soloPlayerInitAudio();
+
+  const ctx = SoloPlayer.ctx;
+  if (!ctx) { alert('お使いのブラウザはWeb Audio APIに対応していません'); return; }
+  if (ctx.state === 'suspended') ctx.resume();
+
+  // 一時停止 or シーク後の再開
+  if (SoloPlayer.isPaused && (SoloPlayer.score === score || !score)) {
+    const ctx = SoloPlayer.ctx;
+    SoloPlayer.isPaused       = false;
+    SoloPlayer.isPlaying      = true;
+    SoloPlayer.startAudioTime = ctx.currentTime;
+    SoloPlayer.schedulerTimer = setInterval(_soloPlayerSchedule, SoloPlayer.INTERVAL_MS);
+    _soloPlayerUpdateUI('playing');
+    return;
+  }
+
+  soloPlayerStop(true);
+
+  SoloPlayer.score            = score;
+  SoloPlayer.tempo            = _soloPlayerGetTempo();
+  _soloLastScore              = score;
+
+  const timeline              = _buildAbsoluteTimeline(score, SoloPlayer.tempo);
+  SoloPlayer.allEvents        = timeline.events;
+  SoloPlayer.measureStartTimes = timeline.measureStartTimes;
+  SoloPlayer.totalDuration    = timeline.totalDuration;
+  SoloPlayer.nextEventIdx     = 0;
+  SoloPlayer.currentMeasure   = -1;
+  SoloPlayer.pauseAudioOffset = 0;
+  SoloPlayer.startAudioTime   = ctx.currentTime + 0.05;
+  SoloPlayer.isPlaying        = true;
+  SoloPlayer.isPaused         = false;
+
+  SoloPlayer.schedulerTimer = setInterval(_soloPlayerSchedule, SoloPlayer.INTERVAL_MS);
+  _soloPlayerUpdateUI('playing');
+}
+
+function soloPlayerPause() {
+  if (!SoloPlayer.isPlaying) return;
+  clearInterval(SoloPlayer.schedulerTimer);
+  SoloPlayer.pauseAudioOffset = SoloPlayer.ctx.currentTime
+                                - SoloPlayer.startAudioTime
+                                + SoloPlayer.pauseAudioOffset;
+  SoloPlayer.isPlaying = false;
+  SoloPlayer.isPaused  = true;
+  _soloPlayerUpdateUI('paused');
+}
+
+function soloPlayerStop(silent = false) {
+  clearInterval(SoloPlayer.schedulerTimer);
+  SoloPlayer.isPlaying        = false;
+  SoloPlayer.isPaused         = false;
+  SoloPlayer.nextEventIdx     = 0;
+  SoloPlayer.currentMeasure   = -1;
+  SoloPlayer.pauseAudioOffset = 0;
+  // measureStartTimesは保持（停止後のseekのために必要）
+
+  soloFocusIdx = -1;
+  if (_soloLastScore) drawSoloTab('solo-tab-svg', _soloLastScore, -1);
+
+  if (!silent) {
+    _soloPlayerUpdateUI('stopped');
+    _soloPlayerUpdateMeasureLabel(-1);
+  }
+}
+
+function soloPlayerRestart() {
+  const score = SoloPlayer.score;
+  if (!score) return;
+  clearInterval(SoloPlayer.schedulerTimer);
+  const timeline = _buildAbsoluteTimeline(score, SoloPlayer.tempo);
+  SoloPlayer.nextEventIdx      = 0;
+  SoloPlayer.currentMeasure    = -1;
+  SoloPlayer.pauseAudioOffset  = 0;
+  SoloPlayer.allEvents         = timeline.events;
+  SoloPlayer.measureStartTimes = timeline.measureStartTimes;
+  SoloPlayer.totalDuration     = timeline.totalDuration;
+  SoloPlayer.startAudioTime    = SoloPlayer.ctx.currentTime + 0.05;
+  SoloPlayer.schedulerTimer    = setInterval(_soloPlayerSchedule, SoloPlayer.INTERVAL_MS);
+}
+
+function soloPlayerSetTempo(bpm) {
+  const lbl = document.getElementById('solo-player-bpm-label');
+  if (lbl) lbl.textContent = bpm;
+
+  if (!SoloPlayer.isPlaying || !SoloPlayer.score) {
+    SoloPlayer.tempo = bpm;
+    return;
+  }
+
+  const oldTempo      = SoloPlayer.tempo;
+  SoloPlayer.tempo    = bpm;
+
+  // 旧テンポ基準の経過秒 → 拍位置に変換 → 新テンポ秒に再変換
+  const elapsed       = SoloPlayer.ctx.currentTime
+                        - SoloPlayer.startAudioTime
+                        + SoloPlayer.pauseAudioOffset;
+  const oldSecPerBeat = 60 / oldTempo;
+  const newSecPerBeat = 60 / bpm;
+  const beatPosition  = elapsed / oldSecPerBeat;
+  const newOffset     = beatPosition * newSecPerBeat;
+
+  // [BugE] allEvents・measureStartTimes を先に再構築してから
+  //        startAudioTime を更新することで、スケジューラが
+  //        1インターバル間の空白なく新テンポで動作できるようにする
+  const timeline              = _buildAbsoluteTimeline(SoloPlayer.score, bpm);
+  SoloPlayer.allEvents        = timeline.events;
+  SoloPlayer.measureStartTimes = timeline.measureStartTimes;
+  SoloPlayer.totalDuration    = timeline.totalDuration;
+  SoloPlayer.pauseAudioOffset = Math.max(0, newOffset);
+
+  const idx = SoloPlayer.allEvents.findIndex(ev => ev.absTime >= SoloPlayer.pauseAudioOffset);
+  SoloPlayer.nextEventIdx = idx >= 0 ? idx : SoloPlayer.allEvents.length;
+
+  // allEvents・nextEventIdx 確定後に startAudioTime を更新
+  SoloPlayer.startAudioTime = SoloPlayer.ctx.currentTime;
+}
+
+function soloPlayerToggleLoop(btn) {
+  SoloPlayer.loop = !SoloPlayer.loop;
+  if (btn) {
+    btn.classList.toggle('active', SoloPlayer.loop);
+    btn.textContent = SoloPlayer.loop ? '🔁 ループON' : '🔁 ループ';
+  }
+}
+
+// ---------------------------------------------------------------
+// 小節シーク: 指定小節の先頭に再生位置をジャンプする
+// 停止中・再生中・一時停止中すべてで動作する。
+// ---------------------------------------------------------------
+
+/**
+ * @param {number} mi  ジャンプ先の小節インデックス（0始まり）
+ */
+function soloPlayerSeekToMeasure(mi) {
+  const score = SoloPlayer.score ?? _soloLastScore;
+  if (!score) return;
+
+  const totalMeasures = score.measures.length;
+  const targetMi = Math.max(0, Math.min(mi, totalMeasures - 1));
+
+  // タイムラインが未構築（停止中）なら構築する
+  if (!SoloPlayer.measureStartTimes || SoloPlayer.measureStartTimes.length === 0) {
+    const tempo    = _soloPlayerGetTempo();
+    const timeline = _buildAbsoluteTimeline(score, tempo);
+    SoloPlayer.score            = score;
+    SoloPlayer.tempo            = tempo;
+    SoloPlayer.allEvents        = timeline.events;
+    SoloPlayer.measureStartTimes = timeline.measureStartTimes;
+    SoloPlayer.totalDuration    = timeline.totalDuration;
+  }
+
+  const newOffset = SoloPlayer.measureStartTimes[targetMi] ?? 0;
+
+  if (SoloPlayer.isPlaying) {
+    // 再生中: pauseAudioOffset を書き換えて nextEventIdx を更新
+    SoloPlayer.pauseAudioOffset = newOffset;
+    SoloPlayer.startAudioTime   = SoloPlayer.ctx.currentTime;
+    const idx = SoloPlayer.allEvents.findIndex(ev => ev.absTime >= newOffset);
+    SoloPlayer.nextEventIdx = idx >= 0 ? idx : SoloPlayer.allEvents.length;
+  } else {
+    // 停止中 or 一時停止中: offset だけ記憶（次の再生開始時に使われる）
+    SoloPlayer.pauseAudioOffset = newOffset;
+    const idx = SoloPlayer.allEvents.findIndex(ev => ev.absTime >= newOffset);
+    SoloPlayer.nextEventIdx = idx >= 0 ? idx : SoloPlayer.allEvents.length;
+    // isPaused フラグを立てて「再開」扱いにする（soloPlayerPlay が offset を引き継ぐ）
+    SoloPlayer.isPaused = true;
+    SoloPlayer.score    = score;
+  }
+
+  // ハイライト・ラベルを即時更新
+  SoloPlayer.currentMeasure = targetMi;
+  soloFocusIdx = targetMi;
+  soloRenderTabSectionFast();
+  _soloPlayerUpdateMeasureLabel(targetMi);
+  // 一時停止状態にUI更新（停止中から操作した場合も「再開」ボタン表示に）
+  if (!SoloPlayer.isPlaying) {
+    _soloPlayerUpdateUI('paused');
+  }
+}
+
+function soloPlayerToggleMute(voice, btn) {
+  SoloPlayer.mute[voice] = !SoloPlayer.mute[voice];
+  if (btn) btn.classList.toggle('muted', SoloPlayer.mute[voice]);
+}
+
+// ---------------------------------------------------------------
+// 内部ユーティリティ
+// ---------------------------------------------------------------
+
+function _soloPlayerGetTempo() {
+  const el = document.getElementById('solo-player-bpm');
+  if (el) return parseInt(el.value, 10);
+  return SoloPlayer.score?.tempo ?? 100;
+}
+
+function _soloPlayerUpdateUI(state) {
+  const play  = document.getElementById('solo-player-play');
+  const pause = document.getElementById('solo-player-pause');
+  const stop  = document.getElementById('solo-player-stop');
+  if (!play) return;
+
+  if (state === 'playing') {
+    play.disabled  = true;  pause.disabled = false; stop.disabled  = false;
+    play.textContent  = '▶ 再生中';
+    pause.textContent = '⏸ 一時停止';
+  } else if (state === 'paused') {
+    play.disabled  = false; pause.disabled = true;  stop.disabled  = false;
+    play.textContent  = '▶ 再開';
+    pause.textContent = '⏸ 一時停止';
+  } else {
+    play.disabled  = false; pause.disabled = true;  stop.disabled  = true;
+    play.textContent  = '▶ 再生';
+    pause.textContent = '⏸ 一時停止';
+  }
+}
+
+function _soloPlayerUpdateMeasureLabel(mi) {
+  const el = document.getElementById('solo-player-measure-label');
+  if (!el) return;
+  el.textContent = (mi < 0 || !SoloPlayer.score)
+    ? '–'
+    : `${mi + 1} / ${SoloPlayer.score.measures.length}`;
+
+  // seekInputも現在小節に同期（ユーザーが編集中でなければ）
+  const seekInput = document.getElementById('solo-player-seek-input');
+  if (seekInput && document.activeElement !== seekInput && mi >= 0) {
+    seekInput.value = mi + 1;
+  }
+}
+
+// ---------------------------------------------------------------
+// コントロールバー描画（差分更新）
+// ---------------------------------------------------------------
+
+function soloPlayerRenderControlBar(score) {
+  const wrap = document.getElementById('solo-player-bar');
+  if (!wrap) return;
+
+  const initTempo = score?.tempo ?? SoloPlayer.tempo ?? 100;
+  SoloPlayer.tempo = initTempo;
+
+  // 既に描画済みなら値だけ更新してちらつきを防ぐ
+  if (document.getElementById('solo-player-play')) {
+    const slider = document.getElementById('solo-player-bpm');
+    const label  = document.getElementById('solo-player-bpm-label');
+    if (!SoloPlayer.isPlaying) {
+      if (slider) slider.value = initTempo;
+      if (label)  label.textContent = initTempo;
+    }
+    _soloPlayerUpdateUI(
+      SoloPlayer.isPlaying ? 'playing' :
+      SoloPlayer.isPaused  ? 'paused'  : 'stopped'
+    );
+    return;
+  }
+
+  // 初回描画
+  wrap.innerHTML = `
+    <div class="solo-player-bar">
+      <div class="solo-player-btns">
+        <button id="solo-player-play" class="solo-player-btn primary"
+                onclick="soloPlayerPlay(_soloLastScore)">▶ 再生</button>
+        <button id="solo-player-pause" class="solo-player-btn" disabled
+                onclick="soloPlayerPause()">⏸ 一時停止</button>
+        <button id="solo-player-stop" class="solo-player-btn" disabled
+                onclick="soloPlayerStop()">⏹ 停止</button>
+      </div>
+      <div class="solo-player-tempo">
+        <span class="solo-player-label">♩=</span>
+        <input id="solo-player-bpm" type="range"
+               min="40" max="200" step="1" value="${initTempo}"
+               class="solo-player-slider"
+               oninput="soloPlayerSetTempo(parseInt(this.value))">
+        <span id="solo-player-bpm-label" class="solo-player-bpm-val">${initTempo}</span>
+      </div>
+      <div class="solo-player-right">
+        <button class="solo-player-btn solo-player-loop ${SoloPlayer.loop ? 'active' : ''}"
+                onclick="soloPlayerToggleLoop(this)">
+          🔁 ループ${SoloPlayer.loop ? 'ON' : ''}
+        </button>
+        <span class="solo-player-measure-wrap">
+          小節: <span id="solo-player-measure-label">–</span>
+        </span>
+      </div>
+    </div>
+    <div class="solo-player-seek-row">
+      <span class="solo-player-label">小節スキップ：</span>
+      <button class="solo-player-seek-btn" title="先頭へ"
+              onclick="soloPlayerSeekToMeasure(0)">⏮</button>
+      <button class="solo-player-seek-btn" title="前の小節"
+              onclick="soloPlayerSeekToMeasure((SoloPlayer.currentMeasure >= 1 ? SoloPlayer.currentMeasure : 1) - 1)">◀</button>
+      <input  id="solo-player-seek-input" type="number"
+              min="1" max="${score?.measures?.length ?? 99}" value="1"
+              class="solo-player-seek-input"
+              title="ジャンプ先の小節番号を入力してEnter"
+              onkeydown="if(event.key==='Enter'){ soloPlayerSeekToMeasure(parseInt(this.value,10)-1); this.blur(); }"
+              onblur="soloPlayerSeekToMeasure(parseInt(this.value,10)-1)">
+      <span class="solo-player-seek-total">/ ${score?.measures?.length ?? '–'}</span>
+      <button class="solo-player-seek-btn" title="次の小節"
+              onclick="soloPlayerSeekToMeasure((SoloPlayer.currentMeasure < 0 ? 0 : SoloPlayer.currentMeasure) + 1)">▶</button>
+      <button class="solo-player-seek-btn" title="末尾へ"
+              onclick="soloPlayerSeekToMeasure((SoloPlayer.score ?? _soloLastScore)?.measures?.length - 1 ?? 0)">⏭</button>
+    </div>
+    <div class="solo-player-mute-row">
+      <span class="solo-player-label">声部：</span>
+      <button class="solo-player-mute-btn ${SoloPlayer.mute.melody ? 'muted' : ''}"
+              onclick="soloPlayerToggleMute('melody', this)">
+        <span class="mute-dot" style="background:#1D9E75"></span>メロディ
+      </button>
+      <button class="solo-player-mute-btn ${SoloPlayer.mute.bass ? 'muted' : ''}"
+              onclick="soloPlayerToggleMute('bass', this)">
+        <span class="mute-dot" style="background:#378ADD"></span>ベース
+      </button>
+      <button class="solo-player-mute-btn ${SoloPlayer.mute.inner ? 'muted' : ''}"
+              onclick="soloPlayerToggleMute('inner', this)">
+        <span class="mute-dot" style="background:#888780"></span>内声
+      </button>
+    </div>`;
+
+  _soloPlayerUpdateUI('stopped');
+}
+
+// ---------------------------------------------------------------
+// クリーンアップ
+// ---------------------------------------------------------------
+
+window.addEventListener('beforeunload', () => {
+  soloPlayerStop(true);
+  try { if (SoloPlayer.ctx) SoloPlayer.ctx.close(); } catch (_) {}
+});
+</script>
