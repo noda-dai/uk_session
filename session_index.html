@@ -335,6 +335,30 @@
     <svg id="ss-freq-viz" viewBox="0 0 680 200" preserveAspectRatio="xMidYMid meet"></svg>
   </div>
 
+  <!-- 指板ガイド（機能②） -->
+  <div class="ss-section">
+    <div class="ss-section-title">🎸 指板ガイド（コードトーン）</div>
+    <div style="font-size:11px;color:var(--text2);margin-bottom:8px;line-height:1.6">
+      今のコードで「弾けば外れない音」が光ります。色の意味はTAB譜と共通です：
+      <span style="color:#1D9E75;font-weight:700">緑=ルート</span>　
+      <span style="color:#378ADD;font-weight:700">青=安定音</span>　
+      <span style="color:#7F77DD;font-weight:700">紫=色彩音</span>　
+      <span style="color:#D85A30;font-weight:700">橙=テンション</span>
+    </div>
+    <svg id="ss-fretboard-svg" viewBox="0 0 680 190" preserveAspectRatio="xMidYMid meet"
+         style="width:100%;display:block;background:var(--surface);border-radius:8px"></svg>
+  </div>
+
+  <!-- おすすめフレーズ（機能③・ビギナー時のみ表示） -->
+  <div class="ss-section" id="ss-phrase-section" style="display:none">
+    <div class="ss-section-title">💡 おすすめフレーズ（お手本）</div>
+    <div style="font-size:11px;color:var(--text2);margin-bottom:8px;line-height:1.6">
+      弾き方に迷ったら、この中から1つ選んで真似してみましょう。もちろん無視して自由に弾いてもOKです。
+    </div>
+    <div id="ss-phrase-cards"
+         style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px"></div>
+  </div>
+
   <!-- パートナータブ譜（再生コントロール・ヒントをタブ譜の上に配置） -->
   <div class="ss-section">
     <div class="ss-section-title">🎼 パートナーのタブ譜</div>
@@ -411,6 +435,8 @@
   <?!= include('js_midiParser'); ?>
   <?!= include('js_scoreImport'); ?>
   <?!= include('session_data'); ?>
+  <?!= include('session_fretboard_guide'); ?>
+  <?!= include('session_phrase_suggest'); ?>
   <?!= include('session_engine'); ?>
   <?!= include('session_player'); ?>
   <?!= include('session_ui'); ?>

@@ -1,0 +1,149 @@
+<script>
+// ===================================================================
+// session_fretboard_guide.html — リアルタイム指板ガイド（機能②）
+//
+// 【設計メモ】
+//   js_drawFretboard.html の drawHighPos() / drawFretboard() は
+//   どちらも「1本の弦につき1フレットだけを示す運指フォーム表示」用に
+//   作られており、「全弦・全フレット上でコードトーン該当箇所を光らせる」
+//   という本機能の要件とは表示形式が異なるため、そのまま流用できない。
+//   （drawFretboard() は旧アプリ固有のグローバル変数 SCALE/HALF/PENTA/
+//    CHORDS/currentChord/currentKey/handleTap にも依存しており、
+//    SessionSpace にそのまま持ち込むと参照エラーになる）
+//
+//   そのため、レイアウト計算（弦間隔・フレット幅など）の考え方だけを
+//   踏襲しつつ、SessionSpace専用の独立した描画関数として新規に実装する。
+//
+//   色分けは TAB譜（solo_js_drawing.txt）と統一するため、
+//   独自の色を定義せず SOLO_ROLE_COLORS をそのまま再利用する。
+//   TAB譜と指板ガイドで「緑=ルート」の意味が食い違うと学習の妨げに
+//   なるため、色の意味は常にアプリ全体で1つに統一する。
+//
+//   コードトーンでないフレットは描画しない（引き算表示）。
+//   4弦×13フレットの全マスに薄い点を敷き詰めると視認性が落ちるうえ、
+//   本アプリが一貫して採用している「occupied/free だけを見せる」
+//   （周波数帯域マップと同じ）設計思想とも合わせている。
+//
+// 依存:
+//   js_data.txt          — getThemeColors
+//   js_melodyEngine.txt  — getChordStructure
+//   solo_js_drawing.txt  — SOLO_ROLE_COLORS
+//   session_data.txt     — INSTRUMENT_PROFILES（tuning情報）
+// ===================================================================
+
+const FRETBOARD_GUIDE_FRET_RANGE = 12;
+
+/**
+ * コード名 + 楽器プロファイルから、全弦・全フレットの役割マップを作る。
+ *
+ * @param {string} chordName        コード名（例: 'Am7'）
+ * @param {object} tuningProfile    INSTRUMENT_PROFILES[key]（tuning配列を持つ楽器のみ対応）
+ * @param {number} [fretRange=12]   計算する最大フレット数
+ * @returns {Array<{stringIdx:number, frets:Array<{fret:number, midi:number, role:string|null}>}>|null}
+ *          解決できない場合（コード名が不明・楽器にtuningがない等）は null
+ */
+function buildFretboardGuideMap(chordName, tuningProfile, fretRange = FRETBOARD_GUIDE_FRET_RANGE) {
+  if (!tuningProfile || !tuningProfile.tuning) return null;
+  const struct = (typeof getChordStructure === 'function') ? getChordStructure(chordName) : null;
+  if (!struct) return null;
+
+  return tuningProfile.tuning.map((openMidi, stringIdx) => ({
+    stringIdx,
+    frets: Array.from({ length: fretRange + 1 }, (_, fret) => {
+      const midi   = openMidi + fret;
+      const offset = (midi % 12 - struct.rootPc + 12) % 12;
+      const role   = struct.intervals[offset] ?? null; // 'root'|'stable'|'color'|'tension'|null
+      return { fret, midi, role };
+    }),
+  }));
+}
+
+/**
+ * 指板ガイドをSVGに描画する。
+ *
+ * @param {string}     svgId
+ * @param {Array|null} guideMap       buildFretboardGuideMap() の戻り値（nullなら空表示）
+ * @param {object}     [opts]
+ * @param {number}     [opts.fretRange=12]
+ * @param {string}     [opts.chordLabel]  画面左上に表示するコード名
+ */
+function drawFretboardGuide(svgId, guideMap, opts = {}) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+
+  const fretRange = opts.fretRange ?? FRETBOARD_GUIDE_FRET_RANGE;
+  const clr = (typeof getThemeColors === 'function') ? getThemeColors('fretboard') : {};
+  const ROLE_COLORS = (typeof SOLO_ROLE_COLORS !== 'undefined') ? SOLO_ROLE_COLORS : {
+    root: '#1D9E75', stable: '#378ADD', color: '#7F77DD', tension: '#D85A30',
+  };
+
+  const W = 680, H = 190;
+  const ML = 40, MR = 12, MT = 26, MB = 16;
+  const SS = (H - MT - MB) / 4; // 4弦固定
+  const FW = (W - ML - MR) / fretRange;
+
+  let h = `<rect x="0" y="0" width="${W}" height="${H}" fill="transparent"/>`;
+
+  if (!guideMap) {
+    h += `<text x="${W / 2}" y="${H / 2}" text-anchor="middle" dominant-baseline="middle"
+               font-size="12" fill="${clr.muted ?? 'var(--text3)'}">
+            コードが決まるとここに光ります
+          </text>`;
+    svg.innerHTML = h;
+    return;
+  }
+
+  if (opts.chordLabel) {
+    h += `<text x="${ML}" y="14" font-size="12" font-weight="700" fill="${clr.text ?? 'var(--text)'}">
+            ${opts.chordLabel}
+          </text>`;
+  }
+
+  // ナット
+  h += `<rect x="${ML - 3}" y="${MT}" width="4" height="${4 * SS}"
+             fill="${clr.nut ?? 'rgba(0,0,0,0.3)'}" rx="2"/>`;
+
+  // フレット線 + ポジションマーク
+  for (let f = 1; f <= fretRange; f++) {
+    const x = ML + f * FW;
+    h += `<line x1="${x}" y1="${MT}" x2="${x}" y2="${MT + 4 * SS}"
+               stroke="${clr.border ?? 'rgba(0,0,0,0.12)'}" stroke-width="1"/>`;
+    if ([3, 5, 7, 10].includes(f)) {
+      h += `<circle cx="${ML + (f - 0.5) * FW}" cy="${MT + 4 * SS + 8}" r="2.5"
+                 fill="${clr.border ?? 'rgba(0,0,0,0.12)'}"/>`;
+    }
+  }
+
+  // 表示順: 上から A弦, E弦, C弦, G弦（TAB譜=ALL_STRINGSと同じ並びに統一）
+  const DISPLAY_ORDER = [3, 2, 1, 0];
+  const STR_LABEL = { 0: 'G', 1: 'C', 2: 'E', 3: 'A' };
+
+  DISPLAY_ORDER.forEach((si, row) => {
+    const y = MT + row * SS + SS / 2;
+    h += `<line x1="${ML - 3}" y1="${y}" x2="${W - MR}" y2="${y}"
+               stroke="${clr.string ?? 'rgba(0,0,0,0.18)'}" stroke-width="${0.8 + row * 0.15}"/>`;
+    h += `<text x="${ML - 16}" y="${y + 1}" text-anchor="middle" dominant-baseline="central"
+               font-size="10" fill="${clr.text2 ?? 'var(--text2)'}">${STR_LABEL[si]}</text>`;
+
+    const strData = guideMap.find(s => s.stringIdx === si);
+    if (!strData) return;
+
+    strData.frets.forEach(({ fret, role }) => {
+      if (fret > fretRange) return;
+      if (!role) return; // コードトーン以外は描画しない（引き算表示）
+
+      const cx    = fret === 0 ? ML - 3 : ML + (fret - 0.5) * FW;
+      const color = ROLE_COLORS[role] ?? '#888780';
+      const r     = fret === 0 ? 9 : 11;
+
+      h += `<circle cx="${cx}" cy="${y}" r="${r}" fill="${color}" opacity="0.92"/>`;
+      if (role === 'root') {
+        h += `<circle cx="${cx}" cy="${y}" r="${r + 4}" fill="none"
+                   stroke="${color}" stroke-width="1.5" opacity="0.5"/>`;
+      }
+    });
+  });
+
+  svg.innerHTML = h;
+}
+</script>

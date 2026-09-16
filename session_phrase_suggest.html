@@ -1,0 +1,241 @@
+<script>
+// ===================================================================
+// session_phrase_suggest.html — 選択式おすすめフレーズ（機能③）
+//
+// 【設計方針（フレーズの有効性についての合意事項）】
+//   「コード構成音だけに縛る」は和声的な安全性（外れた音を出さない）は
+//   保証するが、それだけでは「曲調に合っている」「今弾いても濁らない」
+//   ことまでは保証できない。そのため以下の4つを必ず満たしてから
+//   フレーズを生成する。
+//
+//   ① 和声安全性:     buildChordMidiSet() のコード構成音のみを使う
+//                     （経過音・ブルーノート等の非構成音は混ぜない）
+//   ② ジャンル整合性:  RHYTHMIC_MOTIF_CATALOG を曲調タグでフィルタしてから
+//                     音程パターンを適用する（既存の _selectRhythmicMotif
+//                     と同じ考え方を1小節単位に縮小して再利用）
+//   ③ 複雑度整合性:    COMPLEXITY_PRESETS の値で音数上限を変える
+//                     （applySubtractionVoicing と同じ思想）
+//   ④ 帯域衝突回避:    score.freqBands[mi] から集計したパートナー占有音域を
+//                     候補プールから除外する。「和音としては正しいが
+//                     今弾くと濁る」を機械的に防ぐ（このアプリの根幹である
+//                     「空きを探す」思想と矛盾しないようにする）
+//   ⑤ 最低限の脈絡:    直前フレーズの終止音を次のフレーズの開始点にする
+//                     （曲全体を俯瞰する設計ではないため完全な解決ではないが、
+//                     突飛な跳躍を減らす簡易策として採用する）
+//
+//   なお、真に自由な作曲的判断力を鍛えたい場合は、既存の find_space
+//   （隙間を探せ）モードやハードモードで訓練する設計になっているため、
+//   本機能は「安全側に倒した、取っ掛かりのお手本」として割り切る。
+//
+// 依存:
+//   js_melodyEngine.txt — buildChordMidiSet, RHYTHMIC_MOTIF_CATALOG
+//   session_data.txt    — INSTRUMENT_PROFILES, COMPLEXITY_PRESETS
+//   js_data.txt          — getThemeColors
+//   solo_js_drawing.txt  — SOLO_ROLE_COLORS
+// ===================================================================
+
+/**
+ * 現在のコードに対する短尺フレーズ候補を数種類生成する。
+ *
+ * @param {string} chordName
+ * @param {string} key
+ * @param {object} opts
+ * @param {string}   [opts.genre]           曲調（RHYTHMIC_MOTIF_CATALOGのtagsと照合）
+ * @param {number}   [opts.complexity=0.5]  0.0〜1.0（COMPLEXITY_PRESETS[*].value）
+ * @param {number[]} [opts.occupiedMidi=[]] その小節でパートナーが占有しているMIDI（除外対象）
+ * @param {number|null} [opts.prevEndMidi]  直前フレーズの終止音（脈絡用の開始点）
+ * @param {string}   [opts.userInstrument='ukulele_high_g']
+ * @param {number}   [opts.count=3]         生成する候補数
+ * @returns {Array<{notes:object[], motifName:string, endMidi:number}>}
+ */
+function suggestShortPhrases(chordName, key, opts = {}) {
+  const {
+    genre          = null,
+    complexity     = 0.5,
+    occupiedMidi   = [],
+    prevEndMidi    = null,
+    userInstrument = 'ukulele_high_g',
+    count          = 3,
+  } = opts;
+
+  const profile = (typeof INSTRUMENT_PROFILES !== 'undefined') ? INSTRUMENT_PROFILES[userInstrument] : null;
+  if (!profile || !profile.tuning) return [];
+  if (typeof buildChordMidiSet !== 'function') return [];
+
+  const rangeLow  = profile.range?.min ?? 60;
+  const rangeHigh = profile.range?.max ?? 81;
+
+  // ① 和声安全プール（コード構成音のみ）
+  const fullPool = buildChordMidiSet(chordName, key, rangeLow, rangeHigh);
+  if (fullPool.length === 0) return [];
+
+  // ④ 帯域衝突回避（パートナー占有音を除外）
+  const occupiedSet = new Set(occupiedMidi);
+  let pool = fullPool.filter(e => !occupiedSet.has(e.midi));
+  // 空きがほぼ無い小節では、衝突回避を諦めて最低限の候補は出す
+  // （提案自体を完全に消すより、和声的には安全な音を出す方を優先する）
+  if (pool.length < 2) pool = fullPool;
+
+  // ③ 複雑度で音数上限を決定
+  const maxNotes = complexity < 0.4 ? 3 : complexity < 0.8 ? 4 : 5;
+
+  // ② ジャンルに合うリズムモチーフだけに絞る
+  const catalog = (typeof RHYTHMIC_MOTIF_CATALOG !== 'undefined') ? RHYTHMIC_MOTIF_CATALOG : [];
+  const genreFiltered = genre
+    ? catalog.filter(m => m.tags.includes(genre) || m.tags.includes('arch'))
+    : catalog;
+  const rhythmPool = genreFiltered.length > 0 ? genreFiltered : catalog;
+  if (rhythmPool.length === 0) return [];
+
+  // ⑤ 直前フレーズの終止音を開始点にする（なければプール内の最初の音）
+  const seedStart = prevEndMidi ?? pool[0].midi;
+
+  const results = [];
+  for (let i = 0; i < count; i++) {
+    const motif = rhythmPool[(i * 3) % rhythmPool.length]; // 候補同士が似すぎないようずらす
+    const phrase = _buildPhraseFromMotif(motif, pool, seedStart, maxNotes, profile);
+    if (phrase) results.push(phrase);
+  }
+
+  // 同一音列の重複を除去
+  const seen = new Set();
+  return results.filter(p => {
+    const sig = p.notes.map(n => n.midi).join(',');
+    if (seen.has(sig)) return false;
+    seen.add(sig);
+    return true;
+  });
+}
+
+/**
+ * リズミックモチーフ（音程パターン＋リズム）を、和声安全プールにスナップさせながら
+ * 実際のフレーズ（MIDI列＋弦/フレット）に変換する。
+ * @private
+ */
+function _buildPhraseFromMotif(motif, pool, startMidi, maxNotes, profile) {
+  const rhythm = motif.rhythm.slice(0, maxNotes);
+  if (rhythm.length === 0) return null;
+  const intervals = motif.intervals.slice(0, rhythm.length - 1);
+
+  const first = _nearestInPool(pool, startMidi);
+  if (!first) return null;
+
+  const picked = [{ midi: first.midi, role: first.role }];
+  let curMidi = first.midi;
+
+  intervals.forEach(iv => {
+    const nearest = _nearestInPool(pool, curMidi + iv);
+    if (nearest) {
+      picked.push({ midi: nearest.midi, role: nearest.role });
+      curMidi = nearest.midi;
+    } else {
+      // プール内に妥当な移動先がなければ、跳躍せず直前音を維持する
+      picked.push({ midi: curMidi, role: picked[picked.length - 1].role });
+    }
+  });
+
+  let beat = 1;
+  const events = picked.map((n, i) => {
+    const dur = rhythm[i] ?? 0.5;
+    const ev  = { beat, duration: dur, midi: n.midi, role: n.role, stringIdx: null, fret: null };
+    beat += dur;
+    return ev;
+  });
+
+  events.forEach(ev => {
+    const fretOpts = _fretOptionsForTuning(ev.midi, profile.tuning);
+    if (fretOpts.length > 0) {
+      ev.stringIdx = fretOpts[0].stringIdx;
+      ev.fret      = fretOpts[0].fret;
+    }
+  });
+
+  return {
+    notes:     events,
+    motifName: motif.name,
+    endMidi:   events[events.length - 1].midi,
+  };
+}
+
+function _nearestInPool(pool, targetMidi) {
+  if (!pool || pool.length === 0) return null;
+  return pool.reduce((best, e) =>
+    Math.abs(e.midi - targetMidi) < Math.abs(best.midi - targetMidi) ? e : best
+  , pool[0]);
+}
+
+/**
+ * 指定チューニング（開放弦MIDI配列）での押弦候補を返す。
+ * js_data.txt の midiToFretOptions() はHigh-G固定のため、
+ * Low-Gウクレレ等の任意チューニングにも対応できるよう汎用版を用意する。
+ * @private
+ */
+function _fretOptionsForTuning(midi, tuning) {
+  if (!tuning) return [];
+  const results = [];
+  tuning.forEach((openMidi, stringIdx) => {
+    const fret = midi - openMidi;
+    if (fret >= 0 && fret <= 12) results.push({ stringIdx, fret });
+  });
+  results.sort((a, b) => a.fret - b.fret);
+  return results;
+}
+
+// ---------------------------------------------------------------
+// 描画: 短尺フレーズカード（ミニTAB表示）
+// ---------------------------------------------------------------
+
+/**
+ * フレーズを小さな「数珠つなぎ」カードとして描画する。
+ * 完全なTAB譜ではなく、順番と弦/フレットが分かる簡易表示に留める
+ * （お手本の提示が目的であり、精密な五線譜的情報までは不要なため）。
+ *
+ * @param {string} svgId
+ * @param {{notes:object[]}|null} phrase
+ */
+function drawPhraseCard(svgId, phrase) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  if (!phrase || !phrase.notes || phrase.notes.length === 0) {
+    svg.innerHTML = '';
+    return;
+  }
+
+  const clr = (typeof getThemeColors === 'function') ? getThemeColors('tab') : {};
+  const ROLE_COLORS = (typeof SOLO_ROLE_COLORS !== 'undefined') ? SOLO_ROLE_COLORS : {
+    root: '#1D9E75', stable: '#378ADD', color: '#7F77DD', tension: '#D85A30',
+  };
+  const STR_NAME = { 0: 'G', 1: 'C', 2: 'E', 3: 'A' };
+
+  const W = 160, H = 64;
+  const notes = phrase.notes;
+  const n = notes.length;
+  const pad  = 18;
+  const step = (W - pad * 2) / Math.max(n - 1, 1);
+
+  let h = `<rect x="0" y="0" width="${W}" height="${H}" fill="transparent"/>`;
+
+  notes.forEach((ev, i) => {
+    const cx = n === 1 ? W / 2 : pad + i * step;
+    const cy = H / 2;
+
+    if (i > 0) {
+      const prevCx = n === 1 ? W / 2 : pad + (i - 1) * step;
+      h += `<line x1="${prevCx + 14}" y1="${cy}" x2="${cx - 14}" y2="${cy}"
+                 stroke="${clr.text2 ?? 'var(--text2)'}" stroke-width="1" opacity="0.4"/>`;
+    }
+
+    const color = ROLE_COLORS[ev.role] ?? '#888780';
+    const label = ev.fret != null
+      ? `${STR_NAME[ev.stringIdx] ?? '?'}${ev.fret}`
+      : '?';
+
+    h += `<circle cx="${cx}" cy="${cy}" r="14" fill="${color}"/>`;
+    h += `<text x="${cx}" y="${cy + 1}" text-anchor="middle" dominant-baseline="central"
+               font-size="10" font-weight="700" fill="#fff"
+               font-family="'DM Mono',monospace">${label}</text>`;
+  });
+
+  svg.innerHTML = h;
+}
+</script>

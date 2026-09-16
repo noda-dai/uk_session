@@ -1,9 +1,16 @@
 <script>
 // ===================================================================
-// session_data.txt  — SessionSpace 定数・楽器プロファイル・役割定義
+// session_data.txt  — SessionSpace 定数・楽器プロファイル・役割定義  v2
+//
+// v1 → v2 の変更:
+//   [Feature-2/4] ASSIST_LEVELS を追加。
+//                 リアルタイム指板ガイド（機能②）とおすすめフレーズ（機能③・未実装）の
+//                 表示可否を切り替えるアシストレベル定義。
+//                 ssMode（練習の形式）とは独立した別軸として session_ui.txt 側で使う。
 //
 // 依存: js_data.txt（CHROMATIC, KEY_DATA, fretToMidi）
-// 参照: session_engine.txt, session_player.txt, session_ui.txt
+// 参照: session_engine.txt, session_player.txt, session_ui.txt,
+//       session_fretboard_guide.txt
 // ===================================================================
 
 // ---------------------------------------------------------------
@@ -204,6 +211,43 @@ const SESSION_MODES = {
     baton:    true,
     scored:   false,
     switchEvery: 4,   // 何小節ごとに入れ替えるか（デフォルト）
+  },
+};
+
+// ---------------------------------------------------------------
+// アシストレベル定義（機能④）  [Feature-2/4]
+//
+// beginner: 指板ガイド + おすすめフレーズ（フレーズ提示はPhase 2で実装予定。
+//           showPhrases フラグだけ先に持たせておき、Phase 2側はこれを見て判定する）
+// normal:   指板ガイドのみ
+// hard:     ガイドなし（現行の耳セッションと同じ）
+//
+// 「隙間を探せ」モード(find_space)選択中は、選んだレベルに関わらず
+// session_ui.txt の _ssShouldShowFretboardGuide() が指板ガイドを
+// 強制的に非表示にする。耳で空きを探す訓練という目的と矛盾するため。
+// ---------------------------------------------------------------
+
+const ASSIST_LEVELS = {
+  beginner: {
+    label:       'ビギナー',
+    emoji:       '🔰',
+    desc:        '指板ガイド表示 + おすすめフレーズ（近日公開）',
+    showGuide:   true,
+    showPhrases: true,
+  },
+  normal: {
+    label:       'ノーマル',
+    emoji:       '🙂',
+    desc:        '指板ガイド表示のみ',
+    showGuide:   true,
+    showPhrases: false,
+  },
+  hard: {
+    label:       'ハード',
+    emoji:       '🔥',
+    desc:        'ガイドなし。耳と帯域マップだけで演奏（現行仕様）',
+    showGuide:   false,
+    showPhrases: false,
   },
 };
 
